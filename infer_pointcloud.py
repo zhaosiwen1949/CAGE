@@ -119,6 +119,15 @@ def get_args_parser():
                         help="Lower percentile (0-100) for robust coordinate extent.")
     parser.add_argument('--pct_high', default=98.0, type=float,
                         help="Upper percentile (0-100) for robust coordinate extent.")
+    parser.add_argument('--crop_iqr_k', default=3.0, type=float,
+                        help="Radial Tukey-fence multiplier for floor-plane outlier "
+                             "rejection: keep points within radius Q3 + k*IQR of the "
+                             "median centre. Larger = more permissive (keeps more).")
+    parser.add_argument('--density_gain', default=1.0, type=float,
+                        help="Contrast multiplier applied to the [0,1] density map "
+                             "before it is clamped back to [0,1] and quantized to "
+                             "uint8. >1 brightens/saturates dense cells so the walls "
+                             "stand out; 1.0 leaves the map unchanged.")
 
     return parser
 
@@ -140,13 +149,15 @@ def reorder_up_axis(xyz, up_axis):
     raise ValueError('Unknown up_axis: {}'.format(up_axis))
 
 
-def _projection_sharpness(coords_1d, bins=256):
+def _projection_sharpness(coords_1d, lo, hi, bins=256):
     """Peakiness of a 1D point distribution: sum of squared normalized histogram.
 
     Maximal when points concentrate into a few bins, i.e. when walls parallel to
-    this axis collapse onto shared coordinates.
+    this axis collapse onto shared coordinates. The histogram range is FIXED by
+    the caller (not derived from the data) so that (a) outliers cannot coarsen the
+    bins and (b) the bounding box growing under rotation cannot bias the score.
     """
-    h, _ = np.histogram(coords_1d, bins=bins)
+    h, _ = np.histogram(coords_1d, bins=bins, range=(lo, hi))
     total = h.sum()
     if total == 0:
         return 0.0
@@ -154,19 +165,45 @@ def _projection_sharpness(coords_1d, bins=256):
     return float(np.sum(h * h))
 
 
-def estimate_yaw(plane_xy, search_deg=45.0, step_deg=0.5, bins=256, max_points=100000):
+def estimate_yaw(xyz, search_deg=45.0, step_deg=0.5, bins=256, max_points=100000,
+                 wall_band=(20.0, 80.0)):
     """Estimate the yaw (rotation about the vertical axis) that best axis-aligns
     the floor plane, using the Manhattan-world assumption.
 
-    For each candidate angle we rotate the 2D points and score how sharply they
-    project onto the x and y axes; the best angle is the one whose rotation makes
-    walls parallel to the image axes. Returns the angle to ROTATE BY to correct.
+    For each candidate angle we rotate the floor-plane points and score how sharply
+    they project onto the x and y axes; the best angle makes walls parallel to the
+    image axes. Two robustness measures matter for real (furnished, noisy) clouds:
+
+      * Only mid-height "wall" points are scored. The floor and ceiling slabs
+        project top-down to filled areas whose marginal histograms are broad and
+        nearly rotation-invariant, swamping the thin, rotation-sensitive wall
+        lines. `wall_band` gives the height percentiles kept (default 20-80).
+      * A single fixed histogram range is shared by every candidate angle (see
+        `_projection_sharpness`).
+
+    Expects the reordered cloud (column 2 = up axis). Returns the angle to
+    ROTATE BY to correct.
     """
-    pts = plane_xy
+    # keep mid-height wall points; drop the floor/ceiling slabs
+    h = xyz[:, 2]
+    h_lo, h_hi = np.percentile(h, wall_band[0]), np.percentile(h, wall_band[1])
+    band = (h >= h_lo) & (h <= h_hi)
+    pts = xyz[band][:, :2]
+    if len(pts) < 100:                      # band too thin -> fall back to all
+        pts = xyz[:, :2]
+    pts = np.asarray(pts, dtype=np.float64)
+
     if len(pts) > max_points:
         # subsample for speed; orientation is a global property
         idx = np.linspace(0, len(pts) - 1, max_points).astype(np.int64)
         pts = pts[idx]
+
+    # center, then fix one histogram range for every angle: rotation about the
+    # center keeps points within +/- their max radius, so this range never clips.
+    pts = pts - pts.mean(axis=0, keepdims=True)
+    radius = float(np.max(np.hypot(pts[:, 0], pts[:, 1]))) if len(pts) else 0.0
+    if radius <= 0:
+        return 0.0
 
     best_angle, best_score = 0.0, -1.0
     angles = np.arange(-search_deg, search_deg + 1e-9, step_deg)
@@ -175,7 +212,8 @@ def estimate_yaw(plane_xy, search_deg=45.0, step_deg=0.5, bins=256, max_points=1
         c, s = np.cos(r), np.sin(r)
         x = pts[:, 0] * c - pts[:, 1] * s
         y = pts[:, 0] * s + pts[:, 1] * c
-        score = _projection_sharpness(x, bins) + _projection_sharpness(y, bins)
+        score = (_projection_sharpness(x, -radius, radius, bins) +
+                 _projection_sharpness(y, -radius, radius, bins))
         if score > best_score:
             best_score, best_angle = score, a
     return best_angle
@@ -192,7 +230,8 @@ def rotate_floor_plane(xyz, angle_deg):
 
 
 def load_input(ply_path, up_axis='y', align=True, rotation_deg=None,
-               search_deg=45.0, step_deg=0.5, pct_low=2.0, pct_high=98.0):
+               search_deg=45.0, step_deg=0.5, pct_low=2.0, pct_high=98.0,
+               crop_iqr_k=3.0, density_gain=1.0):
     """Read a .ply point cloud and build the model input density map.
 
     Replicates exactly the tensor the eval pipeline feeds the model:
@@ -207,26 +246,58 @@ def load_input(ply_path, up_axis='y', align=True, rotation_deg=None,
     xyz = points[:, :3].astype(np.float32)
     xyz = reorder_up_axis(xyz, up_axis)
 
+    # Robust extent (reordered frame), recorded for polys_to_3d floor/ceiling.
+    # Taken on the FULL cloud (pre-crop) so the recorded room height is faithful.
+    lo = np.percentile(xyz, pct_low, axis=0).astype(np.float64)
+    hi = np.percentile(xyz, pct_high, axis=0).astype(np.float64)
+
+    # Reject MVS/photogrammetry flyaway points WITHOUT clipping the room:
+    #  * height axis: keep the [pct_low, pct_high] band (1D -> cannot chamfer the
+    #    top-down footprint; also removes floor-noise / sky flyaways).
+    #  * floor plane: a RADIAL Tukey fence about the median centre. A radius test
+    #    is rotation-invariant, so it never chamfers the yawed room's corners --
+    #    those are the per-axis extremes that a tight axis-aligned box, applied in
+    #    the still-tilted frame, would slice off at 45 deg (the octagon artefact).
+    keep_h = (xyz[:, 2] >= lo[2]) & (xyz[:, 2] <= hi[2])
+    cx, cy = np.median(xyz[:, 0]), np.median(xyz[:, 1])
+    rad = np.hypot(xyz[:, 0] - cx, xyz[:, 1] - cy)
+    rq1, rq3 = np.percentile(rad, 25), np.percentile(rad, 75)
+    keep_xy = rad <= rq3 + crop_iqr_k * (rq3 - rq1)
+    core = keep_h & keep_xy
+    n_before = len(xyz)
+    if int(core.sum()) >= 100:
+        xyz = xyz[core]
+    print('  cropped {} -> {} points ({:.1f}% kept; height pct [{:g}, {:g}], '
+          'radial IQR k={:g})'.format(n_before, len(xyz),
+          100.0 * len(xyz) / max(n_before, 1), pct_low, pct_high, crop_iqr_k))
+
     applied_yaw = 0.0
     if rotation_deg is not None:
         applied_yaw = float(rotation_deg)
     elif align:
-        applied_yaw = estimate_yaw(xyz[:, :2], search_deg=search_deg, step_deg=step_deg)
+        applied_yaw = estimate_yaw(xyz, search_deg=search_deg, step_deg=step_deg)
     if applied_yaw != 0.0:
         xyz = rotate_floor_plane(xyz, applied_yaw)
 
     density, norm = generate_density(xyz, width=256, height=256)   # density in [0, 1]
+
+    # Contrast boost: generate_density normalizes by the single busiest cell
+    # (line `density /= density.max()`), so a few very dense cells push the walls
+    # down into the low grey range. Multiply by a gain and re-clamp to [0, 1];
+    # cells above 1/gain of the peak saturate to white, lifting the mid-density
+    # walls. gain == 1.0 is the original, untouched map.
+    if density_gain != 1.0:
+        density = np.clip(density * float(density_gain), 0.0, 1.0)
+
     norm['applied_yaw_deg'] = applied_yaw
     norm['up_axis'] = up_axis
 
-    # Robust extent via percentiles, in the SAME frame as min/max_coords:
-    # generate_density builds `ps` with ps[:,0:2] = xyz[:,0:2] and ps[:,2] = -height.
-    # Percentiles (unlike min/max) are not padded and reject outliers, giving
-    # polys_to_3d.py a cleaner floor/ceiling than the raw extremes.
-    ps = xyz.astype(np.float64).copy()
-    ps[:, 2] = -ps[:, 2]
-    norm['coords_pct_low'] = np.percentile(ps, pct_low, axis=0)
-    norm['coords_pct_high'] = np.percentile(ps, pct_high, axis=0)
+    # Record robust extent for polys_to_3d in the density `ps` frame
+    # (ps[:, 0:2] = xyz[:, 0:2]; ps[:, 2] = -height). Only column 2 (height) is
+    # consumed downstream for floor/ceiling and it is yaw-invariant, so the pre-crop
+    # percentiles above are the right values; columns 0/1 are kept pre-yaw.
+    norm['coords_pct_low'] = np.array([lo[0], lo[1], -hi[2]], dtype=np.float64)
+    norm['coords_pct_high'] = np.array([hi[0], hi[1], -lo[2]], dtype=np.float64)
     norm['percentile'] = {'low': float(pct_low), 'high': float(pct_high)}
 
     density_u8 = (density * 255).astype(np.uint8)                  # cf. export_density
@@ -386,7 +457,8 @@ def main(args):
             ply_path, up_axis=args.up_axis, align=args.align,
             rotation_deg=args.rotation_deg, search_deg=args.align_search_deg,
             step_deg=args.align_step_deg,
-            pct_low=args.pct_low, pct_high=args.pct_high)
+            pct_low=args.pct_low, pct_high=args.pct_high,
+            crop_iqr_k=args.crop_iqr_k, density_gain=args.density_gain)
         print('  applied yaw correction: {:.2f} deg'.format(norm['applied_yaw_deg']))
         room_polys = predict_polys(model, img, device)
         print('  -> {} room polygons'.format(len(room_polys)))
