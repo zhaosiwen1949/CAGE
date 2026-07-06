@@ -71,13 +71,13 @@ We address 2D floorplan reconstruction from 3D scans. Existing approaches typica
 * We recommend an installation through conda:
   * Create an environment:
   ```shell
-  conda create -n cage python=3.8
+  conda create -n cage python=3.10
   conda activate cage
   ```
   * Install pytorch and other required packages:
   ```shell
   # adjust the cuda version accordingly
-  pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 -f https://download.pytorch.org/whl/torch_stable.html
+  pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 -f https://download.pytorch.org/whl/torch_stable.html
   pip install -r requirements.txt
   ```
   * Compile the deformable-attention modules (from [deformable-DETR](https://github.com/fundamentalvision/Deformable-DETR)) and the differentiable rasterization module (from [BoundaryFormer](https://github.com/mlpc-ucsd/BoundaryFormer)):
