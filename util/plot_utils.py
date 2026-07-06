@@ -123,7 +123,7 @@ def plot_floorplan_with_edges(regions, corners=None, edges=None, scale=256,densi
     """Draw floorplan map where different colors indicate different rooms
     """
 
-    regions = [(region * scale / 256).round().astype(np.int) for region in regions]
+    regions = [(region * scale / 256).round().astype(int) for region in regions]
 
     if density_map is not None:
         # Resize and invert density map
@@ -158,7 +158,7 @@ def plot_floorplan_with_regions(regions, corners=None, edges=None, scale=256):
     """
     colors = colors_12
 
-    regions = [(region * scale / 256).round().astype(np.int) for region in regions]
+    regions = [(region * scale / 256).round().astype(int) for region in regions]
 
     # define the color map
     room_colors = [colors[i] for i in range(len(regions))]
@@ -184,9 +184,10 @@ def plot_floorplan_with_regions(regions, corners=None, edges=None, scale=256):
     if len(regions) > 1:
         avg_corner = [region.mean(axis=0) for region in regions]
         ind = np.argsort(np.square(np.array(avg_corner)).sum(axis=1), axis=0)
-        regions = np.array(regions)[ind]
+        regions = np.array(regions, dtype=object)[ind]
 
     for idx, polygon in enumerate(regions):
+        polygon = np.asarray(polygon, dtype=np.int32)
         cv2.fillPoly(room_map, [polygon], color=idx + 1)
 
     image = colorMap[room_map.reshape(-1)].reshape((scale, scale, 4))

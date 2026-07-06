@@ -8,7 +8,7 @@ from shapely.geometry import Polygon
 def extract_regions(adj_mat, corners, corner_sorted):
     all_regions = list()
     cur_idx = 0
-    corners = corners.astype(np.int)
+    corners = corners.astype(int)
     nb_orders = _sort_neighours(adj_mat, corners)
     while cur_idx is not None:
         regions = _get_regions_for_corner(cur_idx, adj_mat, nb_orders)
@@ -309,8 +309,8 @@ colors_12 = [
 def plot_floorplan_with_regions(regions, corners, edges, scale):
     colors = colors_12[:8]
 
-    regions = [(region * scale / 256).round().astype(np.int) for region in regions]
-    corners = (corners * scale / 256).round().astype(np.int)
+    regions = [(region * scale / 256).round().astype(int) for region in regions]
+    corners = (corners * scale / 256).round().astype(int)
 
     # define the color map
     room_colors = [colors[i % 8] for i in range(len(regions))]

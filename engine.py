@@ -123,7 +123,7 @@ def evaluate(model, criterion, dataset_name, data_loader, device,epoch = None):
                 curr_data_rw = S3DRW(curr_opts, mode = "online_eval")
                 evaluator = Evaluator(curr_data_rw, curr_opts)
             elif dataset_name == 'scenecad':
-                gt_polys = [gt_instances[i].gt_masks.polygons[0][0].reshape(-1,2).astype(np.int)]
+                gt_polys = [gt_instances[i].gt_masks.polygons[0][0].reshape(-1,2).astype(int)]
                 evaluator = Evaluator_SceneCAD()
             
             print("Running Evaluation for scene %s" % scene_ids[i])
@@ -276,7 +276,7 @@ def evaluate_floor(model, dataset_name, data_loader, device, output_dir, plot_pr
                     # plot semantically-rich floorplan
                     gt_sem_rich = []
                     for j, poly in enumerate(gt_inst.gt_masks.polygons):
-                        corners = poly[0].reshape(-1, 2).astype(np.int)
+                        corners = poly[0].reshape(-1, 2).astype(int)
                         corners_flip_y = corners.copy()
                         corners_flip_y[:,1] = 255 - corners_flip_y[:,1]
                         corners = corners_flip_y
@@ -312,7 +312,7 @@ def evaluate_floor(model, dataset_name, data_loader, device, output_dir, plot_pr
                 curr_data_rw = S3DRW(curr_opts, mode = "test")
                 evaluator = Evaluator(curr_data_rw, curr_opts)
             elif dataset_name == 'scenecad':
-                gt_polys = [gt_instances[i].gt_masks.polygons[0][0].reshape(-1,2).astype(np.int)]
+                gt_polys = [gt_instances[i].gt_masks.polygons[0][0].reshape(-1,2).astype(int)]
                 evaluator = Evaluator_SceneCAD()
 
             print("Running Evaluation for scene %s" % scene_ids[i])

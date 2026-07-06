@@ -22,7 +22,7 @@ for filename in sorted(os.listdir(pg_base)):
     example_pg = np.load(pg_path, allow_pickle=True).tolist()
 
     corners = example_pg['corners']
-    corners = corners.astype(np.int)
+    corners = corners.astype(int)
     edges = example_pg['edges']
 
     print('Processing file: {}'.format(filename))
