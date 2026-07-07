@@ -47,6 +47,21 @@ def reorder_up_axis(xyz, up_axis):
     raise ValueError('Unknown up_axis: {}'.format(up_axis))
 
 
+def floor_hflip_needed(up_axis):
+    """Whether the floor projection must be mirrored left-right to read as a
+    conventional top-down plan.
+
+    reorder_up_axis moves the up-axis to column 2 via a column permutation whose
+    parity sets the floor-plane handedness: z-up is the identity [0,1,2] and x-up
+    is the 3-cycle [1,2,0] (both EVEN), but y-up is the swap [0,2,1] (ODD). The
+    odd swap flips handedness, so a y-up cloud projects to a MIRROR image -- the
+    floor is effectively seen "from below" -- relative to the z-up convention the
+    model was trained on. Flipping that density map left-right (np.fliplr) puts it
+    back into the standard top-down orientation. z-up / x-up need no flip.
+    """
+    return up_axis == 'y'
+
+
 def _projection_sharpness(coords_1d, lo, hi, bins=256):
     """Peakiness of a 1D point distribution: sum of squared normalized histogram.
 
@@ -171,20 +186,28 @@ def resolve_yaw(xyz, align=True, rotation_deg=None, search_deg=45.0, step_deg=0.
     return 0.0
 
 
-def density_from_xyz(xyz_rot, width=256, height=256, density_gain=1.0):
+def density_from_xyz(xyz_rot, width=256, height=256, density_gain=1.0, hflip=False):
     """Project a (yaw-corrected) cloud to a [0,1] density map, recomputing the
     normalization from the data. Mirrors infer_pointcloud.load_input's projection
-    step (generate_density + optional contrast gain)."""
+    step (generate_density + optional contrast gain).
+
+    `hflip` mirrors the finished density image left-right (np.fliplr) to undo the
+    from-below projection of an odd-permutation up-axis (see floor_hflip_needed).
+    This is a pure image-space flip: the returned `norm` (min/max in the un-flipped
+    ps frame) is unchanged, and pixel_to_world(..., hflip=True) inverts the column
+    so world coordinates -- and thus polys_to_3d -- stay identical."""
     density, norm = generate_density(xyz_rot, width=width, height=height)
     # Contrast boost: generate_density normalizes by the single busiest cell, so a
     # few very dense cells push the walls into the low grey range. Multiply by a
     # gain and re-clamp to [0, 1]; gain == 1.0 leaves the map unchanged.
     if density_gain != 1.0:
         density = np.clip(density * float(density_gain), 0.0, 1.0)
+    if hflip:
+        density = np.ascontiguousarray(np.fliplr(density))
     return density, norm
 
 
-def density_fixed_norm(xyz_rot, min_coords, max_coords, image_res=(256, 256)):
+def density_fixed_norm(xyz_rot, min_coords, max_coords, image_res=(256, 256), hflip=False):
     """Project a (yaw-corrected) cloud to a [0,1] density map using a FIXED
     normalization (min/max) instead of recomputing it from the data.
 
@@ -193,6 +216,10 @@ def density_fixed_norm(xyz_rot, min_coords, max_coords, image_res=(256, 256)):
     stored in a *_polys.json yields a density map on the exact same pixel grid as
     the polygons in that JSON, so a wall mask thresholded from it is pixel-aligned
     with the predicted rooms.
+
+    `hflip` mirrors the finished map left-right (np.fliplr), matching
+    density_from_xyz so the alignment mask lines up with polygons expressed in the
+    same flipped (top-down) frame.
     """
     ps = xyz_rot.astype(np.float64) * -1.0
     ps[:, 0] *= -1.0
@@ -214,20 +241,28 @@ def density_fixed_norm(xyz_rot, min_coords, max_coords, image_res=(256, 256)):
     peak = float(density.max())
     if peak > 0:
         density = density / peak
+    if hflip:
+        density = np.ascontiguousarray(np.fliplr(density))
     return density
 
 
-def pixel_to_world(poly_px, min_coords, max_coords):
+def pixel_to_world(poly_px, min_coords, max_coords, hflip=False):
     """Inverse-project 256-space pixel corners to world (density-projection frame).
 
     generate_density maps world x/y -> [0,1] via (p - min)/(max - min) then to
     pixels by *image_res (256); engine decodes corners with *255, so we invert with
     /255 to match the actual pixel values. The 255-vs-256 discrepancy is a sub-0.4%
     scale ambiguity inherent to the codebase.
+
+    `hflip` must match the flag used to render the density map: np.fliplr on the
+    256-wide image maps column c -> 255 - c, so we decode (255 - col) here. This
+    exactly cancels the flip, leaving world_mm identical to the un-flipped case --
+    so polys_to_3d keeps overlaying on the original .ply with no change.
     """
     mn = np.asarray(min_coords, dtype=np.float64)
     mx = np.asarray(max_coords, dtype=np.float64)
     poly = np.asarray(poly_px, dtype=np.float64)
-    wx = mn[0] + (poly[:, 0] / 255.) * (mx[0] - mn[0])
+    col = (255. - poly[:, 0]) if hflip else poly[:, 0]
+    wx = mn[0] + (col / 255.) * (mx[0] - mn[0])
     wy = mn[1] + (poly[:, 1] / 255.) * (mx[1] - mn[1])
     return np.stack([wx, wy], axis=1)

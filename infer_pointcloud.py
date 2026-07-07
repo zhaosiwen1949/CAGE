@@ -46,6 +46,7 @@ from util.pointcloud import (                               # noqa: E402
     preprocess_xyz,
     resolve_yaw,
     density_from_xyz,
+    floor_hflip_needed,
 )
 
 
@@ -133,13 +134,18 @@ def get_args_parser():
                              "before it is clamped back to [0,1] and quantized to "
                              "uint8. >1 brightens/saturates dense cells so the walls "
                              "stand out; 1.0 leaves the map unchanged.")
+    parser.add_argument('--no_floor_hflip', action='store_true',
+                        help="Disable the left-right flip that un-mirrors the density "
+                             "map for odd-permutation up-axes (y-up). By default a y-up "
+                             "cloud is flipped so the plan reads top-down; z/x-up are "
+                             "never flipped.")
 
     return parser
 
 
 def load_input(ply_path, up_axis='y', align=True, rotation_deg=None,
                search_deg=45.0, step_deg=0.5, pct_low=2.0, pct_high=98.0,
-               crop_iqr_k=3.0, density_gain=1.0):
+               crop_iqr_k=3.0, density_gain=1.0, floor_hflip=True):
     """Read a .ply point cloud and build the model input density map.
 
     Replicates exactly the tensor the eval pipeline feeds the model:
@@ -160,11 +166,14 @@ def load_input(ply_path, up_axis='y', align=True, rotation_deg=None,
     if applied_yaw != 0.0:
         xyz = rotate_floor_plane(xyz, applied_yaw)
 
+    hflip = bool(floor_hflip and floor_hflip_needed(up_axis))
     density, norm = density_from_xyz(xyz, width=256, height=256,
-                                     density_gain=density_gain)  # density in [0, 1]
+                                     density_gain=density_gain,
+                                     hflip=hflip)               # density in [0, 1]
 
     norm['applied_yaw_deg'] = applied_yaw
     norm['up_axis'] = up_axis
+    norm['hflip'] = hflip           # density mirrored L-R (top-down); pixel_to_world inverts it
 
     # Record robust extent for polys_to_3d in the density `ps` frame
     # (ps[:, 0:2] = xyz[:, 0:2]; ps[:, 2] = -height). Only column 2 (height) is
@@ -246,7 +255,10 @@ def pixel_to_world(poly_px, norm):
     mn = np.asarray(norm['min_coords'], dtype=np.float64)
     mx = np.asarray(norm['max_coords'], dtype=np.float64)
     poly = np.asarray(poly_px, dtype=np.float64)
-    wx = mn[0] + (poly[:, 0] / 255.) * (mx[0] - mn[0])
+    # If the density was mirrored L-R (hflip), np.fliplr maps col c -> 255 - c;
+    # decode (255 - col) so world_mm is identical to the un-flipped case.
+    col = (255. - poly[:, 0]) if bool(norm.get('hflip', False)) else poly[:, 0]
+    wx = mn[0] + (col / 255.) * (mx[0] - mn[0])
     wy = mn[1] + (poly[:, 1] / 255.) * (mx[1] - mn[1])
     return np.stack([wx, wy], axis=1)
 
@@ -286,6 +298,7 @@ def save_outputs(name, room_polys, density_u8, norm, output_dir):
             'image_res': np.asarray(norm['image_res']).tolist(),
             'applied_yaw_deg': norm.get('applied_yaw_deg', 0.0),
             'up_axis': norm.get('up_axis'),
+            'hflip': bool(norm.get('hflip', False)),
             'coords_pct_low': (np.asarray(norm['coords_pct_low']).tolist()
                                if 'coords_pct_low' in norm else None),
             'coords_pct_high': (np.asarray(norm['coords_pct_high']).tolist()
@@ -332,7 +345,8 @@ def main(args):
             rotation_deg=args.rotation_deg, search_deg=args.align_search_deg,
             step_deg=args.align_step_deg,
             pct_low=args.pct_low, pct_high=args.pct_high,
-            crop_iqr_k=args.crop_iqr_k, density_gain=args.density_gain)
+            crop_iqr_k=args.crop_iqr_k, density_gain=args.density_gain,
+            floor_hflip=not args.no_floor_hflip)
         print('  applied yaw correction: {:.2f} deg'.format(norm['applied_yaw_deg']))
         room_polys = predict_polys(model, img, device)
         print('  -> {} room polygons'.format(len(room_polys)))
