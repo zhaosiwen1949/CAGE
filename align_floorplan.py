@@ -21,9 +21,18 @@ Pipeline:
      within a pixel tolerance; snap each cluster onto the nearest wall line in
      the mask (or the cluster mean if the mask is silent there). Diagonal-only
      vertices keep their original coordinate on the unconstrained axis.
-  5. Re-project the snapped pixels to world coords and write:
+  5. Split: the model often merges several small rooms into one polygon. A
+     SECOND mask built from a near-ceiling height band (walls reach the
+     ceiling; furniture / bar counters do not, and door openings are closed by
+     their lintels) exposes the interior partition walls. A room is cut along
+     such a wall only under strict evidence -- the wall must span nearly the
+     whole room chord and reach both boundaries -- so single rooms with tall
+     clutter (kitchen duct/cabinets) are never split. Recursive; --no_split
+     turns it off.
+  6. Re-project the snapped pixels to world coords and write:
        {name}_aligned_polys.json, {name}_aligned_floorplan.png,
-       {name}_mask.png, {name}_density_hist.png, {name}_aligned_overlay.png
+       {name}_mask.png, {name}_split_mask.png, {name}_density_hist.png,
+       {name}_aligned_overlay.png
 
 This script has NO torch / model dependency; it only reuses the point-cloud ->
 density pipeline from util.pointcloud (shared with infer_pointcloud.py).
@@ -35,6 +44,7 @@ import os
 
 import cv2
 import numpy as np
+from shapely.geometry import Polygon as ShapelyPolygon, box as shapely_box
 import matplotlib
 matplotlib.use('Agg')                                       # headless / no display
 import matplotlib.pyplot as plt                             # noqa: E402
@@ -114,6 +124,58 @@ def get_args_parser():
                              "continuous run of at least this length count as wall. "
                              "Rejects dashed / broken columns (clutter) that are not "
                              "real walls; raise it to be stricter about continuity.")
+
+    # Room splitting (interior partition walls from a near-ceiling band)
+    parser.add_argument('--no_split', action='store_true',
+                        help="Disable splitting merged rooms along interior partition "
+                             "walls detected in the near-ceiling structural mask "
+                             "(splitting is ON by default).")
+    parser.add_argument('--split_band_lo', default=0.75, type=float,
+                        help="Lower bound of the near-ceiling band, as a fraction of the "
+                             "cropped height range. The band must sit BELOW the ceiling "
+                             "plane itself (a horizontal plane projects everywhere) and "
+                             "above furniture / door tops. Band-sweep on xinghewan: "
+                             "lo in [0.65, 0.82] all give the same correct cuts; lower "
+                             "pulls in mid-height furniture lines, higher thins the "
+                             "walls. 0.75 centres that safe zone.")
+    parser.add_argument('--split_band_hi', default=0.95, type=float,
+                        help="Upper bound of the near-ceiling band (fraction of height "
+                             "range). Keep < 1.0: the topmost slice holds the ceiling "
+                             "plane remnants (per-room dropped ceilings sit at different "
+                             "heights) and floods the mask with blobs. Safe zone on "
+                             "xinghewan: [0.92, 0.98].")
+    parser.add_argument('--split_mask_percentile', default=80.0, type=float,
+                        help="Percentile of non-zero band density used to threshold the "
+                             "structural mask (band statistics are not bimodal, so Otsu "
+                             "is unreliable here).")
+    parser.add_argument('--split_min_cover', default=0.5, type=float,
+                        help="A cut requires the partition wall's continuity-aware pixel "
+                             "count (runs >= --wall_min_run) to cover at least this "
+                             "fraction of the room chord along the cut line. Works with "
+                             "the door-aware gap rules; a free-standing kitchen "
+                             "duct/cabinet line fails the end-anchoring instead.")
+    parser.add_argument('--split_end_gap', default=3, type=int,
+                        help="A cut requires the wall pixels to reach within this many "
+                             "pixels of BOTH room boundaries along the cut line.")
+    parser.add_argument('--split_door_min', default=7, type=int,
+                        help="Interior gaps in the cut line are only legal if they are "
+                             "mask noise (<= 2 px) or door-sized: [door_min, door_max] "
+                             "px. A 3..6 px opening (~0.3-0.6 m) does not exist in a "
+                             "real wall (it is a shower screen / clutter line) and "
+                             "rejects the cut.")
+    parser.add_argument('--split_door_max', default=24, type=int,
+                        help="Upper bound (px) of a door/passage gap in the cut line; "
+                             "wider holes mean the 'wall' is not a real partition.")
+    parser.add_argument('--split_main_cover', default=0.4, type=float,
+                        help="Cross-check: the cut line must ALSO reach this continuity-"
+                             "aware cover in the MAIN full-height mask. A real partition "
+                             "is a full-height wall and shows in both masks; a curtain "
+                             "box / dropped-ceiling edge lives only near the ceiling and "
+                             "a wardrobe front is broken by clutter at lower heights. "
+                             "0 disables the cross-check.")
+    parser.add_argument('--split_min_size', default=8, type=int,
+                        help="Minimum bbox side (px) of every sub-room a cut produces; "
+                             "cuts creating thinner slivers are rejected.")
 
     parser.add_argument('--no_room_labels', action='store_true',
                         help="Do not draw room index numbers on the floorplan / overlay "
@@ -533,6 +595,232 @@ def align_rooms(rooms_px, mask, angle_tol=8.0, snap_tol=5.0, collapse_diag_len=0
 
 
 # ---------------------------------------------------------------------------
+# Room splitting (interior partition walls from a near-ceiling band)
+# ---------------------------------------------------------------------------
+def ceiling_band_mask(xyz_rot, min_coords, max_coords, image_res, hflip,
+                      band_lo=0.80, band_hi=0.95, percentile=80.0):
+    """Project only the near-ceiling points into a STRUCTURAL wall mask.
+
+    Walls run all the way to the ceiling; furniture, bar counters and open door
+    leaves stop well below it, and door OPENINGS are closed by their lintels.
+    So a density map of just the near-ceiling band shows interior partition
+    walls as continuous lines even across doorways, with the clutter gone --
+    exactly the evidence needed to split merged rooms. The band must stay
+    below the ceiling plane itself: the ceiling is a horizontal plane and
+    would project onto every interior pixel, washing the map out.
+
+    The band is expressed as fractions of the cropped height range (xyz_rot has
+    already been percentile/radially cropped, so min/max are robust). Uses the
+    same stored min/max_coords + hflip as the polygons -> pixel-aligned.
+    Returns (mask, n_band_points, threshold_u8).
+    """
+    h = xyz_rot[:, 2]
+    h0, h1 = float(h.min()), float(h.max())
+    lo = h0 + band_lo * (h1 - h0)
+    hi = h0 + band_hi * (h1 - h0)
+    sel = (h >= lo) & (h <= hi)
+    density = density_fixed_norm(xyz_rot[sel], min_coords, max_coords, image_res,
+                                 hflip=hflip)
+    mask, thr = density_to_mask(density, method='percentile', percentile=percentile)
+    return mask, int(sel.sum()), thr
+
+
+_SPLIT_NOISE_GAP = 2        # a hole this short (px) in the cut line is mask noise
+_SPLIT_MAX_NOISE_GAPS = 1   # a real wall line is clean; more holes = clutter line
+
+
+def _denoised_cover(wall, chord_len, min_run):
+    """(cover, gaps): continuity-aware cover of a candidate line and the list of
+    interior hole lengths between its first and last wall pixel."""
+    widx = np.flatnonzero(wall)
+    if widx.size == 0:
+        return 0.0, None
+    sub = (wall[widx[0]:widx[-1] + 1] > 0).astype(np.int8)
+    d = np.diff(np.concatenate(([0], sub, [0])))
+    starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+    runs = ends - starts
+    cover = runs[runs >= min_run].sum() / float(chord_len)
+    return float(cover), starts[1:] - ends[:-1]
+
+
+def _best_split_line_axis(region, region_int, struct_mask, main_mask, axis,
+                          min_cover, main_cover, end_gap, min_size,
+                          wall_min_run, door_min, door_max):
+    """Best door-aware full-span partition wall along one axis, or None.
+
+    axis='x' scans vertical cut lines (columns), axis='y' horizontal (rows).
+    The room chord at a line is restricted to STRICTLY INTERIOR pixels
+    (region_int: room area at least min_size deep on BOTH sides of the line,
+    along the cut axis): where the line rides on the room's own stepped
+    boundary wall, that wall must not masquerade as partition evidence (a
+    bay-window step does exactly that -- the cut line sits a couple of px
+    inside the polygon, on the boundary wall's own thickness).
+    A candidate line c qualifies only if, over that interior chord:
+      * anchoring -- the first/last wall pixel reach within end_gap px of both
+        chord ends: a partition wall is attached to the room boundary on both
+        sides, a free-standing duct/cabinet/counter line on at most one;
+      * coverage -- the continuity-aware count (runs >= wall_min_run, see
+        _wall_score) covers >= min_cover of the chord;
+      * door-aware gaps -- every interior hole in the line is either mask
+        noise (<= _SPLIT_NOISE_GAP px, at most _SPLIT_MAX_NOISE_GAPS of them)
+        or door-sized ([door_min, door_max] px, at most one: the lintel above
+        a doorway is often NOT reconstructed by MVS, so a legal door hole must
+        be tolerated -- but a hole too narrow for any door (shower screens,
+        wardrobe fronts) or a second opening rejects the line, and so does a
+        fragmented tail of many small holes (window / curtain-box clutter);
+      * full height -- the line also reaches main_cover in the MAIN mask: a
+        real partition is a floor-to-ceiling wall and shows at every height;
+        a curtain box / dropped-ceiling edge exists only near the ceiling and
+        a wardrobe front is broken by clutter below, so they fail here.
+    Lines closer than min_size to the room's extent ends are not considered,
+    so both sub-rooms keep at least that thickness. Returns (line, cover).
+    """
+    reg_l = region.T if axis == 'x' else region        # reg_l[c] = pixels on line c
+    int_l = region_int.T if axis == 'x' else region_int
+    msk_l = struct_mask.T if axis == 'x' else struct_mask
+    main_l = main_mask.T if axis == 'x' else main_mask
+    occ = np.flatnonzero(reg_l.sum(axis=1) > 0)
+    if occ.size == 0:
+        return None
+    best = None
+    lo = max(occ[0] + min_size, 1)
+    hi = min(occ[-1] - min_size, reg_l.shape[0] - 2)
+    for c in range(lo, hi + 1):
+        interior = int_l[c]
+        rows = np.flatnonzero(interior)
+        if rows.size < max(min_size, wall_min_run):    # chord too short to judge
+            continue
+        wall = msk_l[c] * interior
+        widx = np.flatnonzero(wall)
+        if widx.size == 0:
+            continue
+        if widx[0] - rows[0] > end_gap or rows[-1] - widx[-1] > end_gap:
+            continue                                   # not anchored on both ends
+        cover, gaps = _denoised_cover(wall, rows.size, wall_min_run)
+        if cover < min_cover:
+            continue
+        noise = gaps <= _SPLIT_NOISE_GAP
+        door = (gaps >= door_min) & (gaps <= door_max)
+        if np.count_nonzero(~noise & ~door) > 0:       # a hole no real wall has
+            continue
+        if np.count_nonzero(noise) > _SPLIT_MAX_NOISE_GAPS or np.count_nonzero(door) > 1:
+            continue
+        if main_cover > 0.0:
+            cover_m, _ = _denoised_cover(main_l[c] * interior, rows.size, wall_min_run)
+            if cover_m < main_cover:
+                continue                               # not a full-height wall
+        if best is None or cover > best[1]:
+            best = (int(c), float(cover))
+    return best
+
+
+def _find_split_line(poly, struct_mask, main_mask, min_cover, main_cover,
+                     end_gap, min_size, wall_min_run, door_min, door_max):
+    """Strongest interior partition wall of a room: ('x'|'y', line, cover) | None."""
+    H, W = struct_mask.shape
+    region = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(region, [np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)], 1)
+    best = None
+    for axis in ('x', 'y'):
+        # dilate 1 px PERPENDICULAR to the cut line so a wall wobbling between
+        # two adjacent columns/rows still reads as one continuous line
+        kernel = np.ones((1, 3), np.uint8) if axis == 'x' else np.ones((3, 1), np.uint8)
+        dil = cv2.dilate(struct_mask, kernel)
+        dil_main = cv2.dilate(main_mask, kernel)
+        # interior = room area >= min_size deep on both sides ALONG the cut
+        # axis (1-D erosion): mirrors the min-size rule per chord pixel and
+        # keeps the room's own boundary walls out of the evidence
+        ero_kernel = (np.ones((1, 2 * min_size + 1), np.uint8) if axis == 'x'
+                      else np.ones((2 * min_size + 1, 1), np.uint8))
+        region_int = cv2.erode(region, ero_kernel)
+        cand = _best_split_line_axis(region, region_int, dil, dil_main, axis,
+                                     min_cover, main_cover, end_gap, min_size,
+                                     wall_min_run, door_min, door_max)
+        if cand is not None and (best is None or cand[1] > best[2]):
+            best = (axis, cand[0], cand[1])
+    return best
+
+
+def _cut_polygon(poly, axis, line):
+    """Cut a pixel polygon by the axis line; both halves KEEP the line itself,
+    so the two sub-rooms share the cut coordinate (the usual shared-wall
+    convention -- zero-area overlap, no gap). Returns shapely Polygons."""
+    P = ShapelyPolygon([(float(x), float(y)) for x, y in poly])
+    if not P.is_valid:
+        P = P.buffer(0)
+    minx, miny, maxx, maxy = P.bounds
+    if axis == 'x':
+        halves = (shapely_box(minx - 1, miny - 1, line, maxy + 1),
+                  shapely_box(line, miny - 1, maxx + 1, maxy + 1))
+    else:
+        halves = (shapely_box(minx - 1, miny - 1, maxx + 1, line),
+                  shapely_box(minx - 1, line, maxx + 1, maxy + 1))
+    pieces = []
+    for half in halves:
+        inter = P.intersection(half)
+        for g in getattr(inter, 'geoms', [inter]):
+            if g.geom_type == 'Polygon' and g.area > 1e-6:
+                pieces.append(g)
+    return pieces
+
+
+def split_rooms(rooms_px, struct_mask, main_mask, min_cover=0.5, main_cover=0.4,
+                end_gap=3, min_size=8, wall_min_run=5, door_min=7, door_max=24,
+                spike_angle_deg=60.0, spike_max_gap=10.0,
+                collinear_tol=2.0, max_depth=6):
+    """Recursively split rooms along interior partition walls in struct_mask.
+
+    Returns (new_rooms, parent_ids, records): new_rooms expand each input room
+    into its sub-rooms in place (children sorted top-to-bottom, left-to-right),
+    parent_ids[i] is the ORIGINAL index each output room came from, records
+    lists every applied cut. A cut is abandoned (room kept whole) if any
+    resulting piece is a sliver thinner than min_size or degenerates during
+    simplification -- better to leave a merged room than to invent a bad one.
+    """
+    new_rooms, parent_ids, records = [], [], []
+    for orig_idx, poly in enumerate(rooms_px):
+        leaves = []
+        queue = [(np.asarray(poly, dtype=np.int32), 0)]
+        while queue:
+            cur, depth = queue.pop(0)
+            found = None
+            if depth < max_depth and len(cur) >= 3:
+                found = _find_split_line(cur, struct_mask, main_mask, min_cover,
+                                         main_cover, end_gap, min_size,
+                                         wall_min_run, door_min, door_max)
+            children = []
+            if found is not None:
+                axis, line, cover = found
+                pieces = _cut_polygon(cur, axis, line)
+                ok = (len(pieces) >= 2
+                      and all(min(g.bounds[2] - g.bounds[0],
+                                  g.bounds[3] - g.bounds[1]) >= min_size
+                              for g in pieces))
+                if ok:
+                    for g in pieces:
+                        pts = [(int(round(x)), int(round(y)))
+                               for x, y in list(g.exterior.coords)[:-1]]
+                        pts = _simplify_polygon(pts, spike_angle_deg=spike_angle_deg,
+                                                spike_max_gap=spike_max_gap,
+                                                collinear_tol=collinear_tol)
+                        if len(pts) >= 3:
+                            children.append(np.asarray(pts, dtype=np.int32))
+                    if len(children) < 2:              # degenerated: abandon the cut
+                        children = []
+                if children:
+                    records.append({'parent': orig_idx, 'axis': axis,
+                                    'line': int(line), 'cover': round(cover, 3)})
+            if children:
+                queue.extend((ch, depth + 1) for ch in children)
+            else:
+                leaves.append(cur)
+        leaves.sort(key=lambda p: (int(p[:, 1].min()), int(p[:, 0].min())))
+        new_rooms.extend(leaves)
+        parent_ids.extend([orig_idx] * len(leaves))
+    return new_rooms, parent_ids, records
+
+
+# ---------------------------------------------------------------------------
 # Debug figure
 # ---------------------------------------------------------------------------
 def save_density_hist(density, thr_u8, method, out_path):
@@ -666,15 +954,60 @@ def main(args):
         print('  collapse_diag_len={:.1f}px: {} -> {} vertices'.format(
             args.collapse_diag_len, n_before, n_after))
 
+    # 3b) split merged rooms along interior partition walls: a near-ceiling
+    #     band exposes them (lintels close the doorways, furniture drops out)
+    struct_mask, splits = None, []
+    parent_ids = list(range(len(aligned)))
+    if not args.no_split:
+        struct_mask, n_band, split_thr = ceiling_band_mask(
+            xyz, min_coords, max_coords, image_res, dst_hflip,
+            band_lo=args.split_band_lo, band_hi=args.split_band_hi,
+            percentile=args.split_mask_percentile)
+        n_rooms_before = len(aligned)
+        aligned, parent_ids, splits = split_rooms(
+            aligned, struct_mask, mask, min_cover=args.split_min_cover,
+            main_cover=args.split_main_cover, end_gap=args.split_end_gap,
+            min_size=args.split_min_size, wall_min_run=args.wall_min_run,
+            door_min=args.split_door_min, door_max=args.split_door_max,
+            spike_angle_deg=args.spike_angle_deg,
+            spike_max_gap=args.spike_max_gap, collinear_tol=args.collinear_tol)
+        print('  split: ceiling band [{:.2f},{:.2f}] ({} pts, thr={:.1f}/255): '
+              '{} -> {} rooms'.format(args.split_band_lo, args.split_band_hi,
+                                      n_band, split_thr, n_rooms_before,
+                                      len(aligned)))
+        for rec in splits:
+            print('    room {} cut at {}={} (cover {:.0%})'.format(
+                rec['parent'], rec['axis'], rec['line'], rec['cover']))
+        if splits:
+            # Cut lines are chosen per room from the struct mask, INDEPENDENTLY
+            # of where neighbouring rooms' walls were already snapped. On a
+            # thick wall band both picks are "on the wall" yet a few px apart
+            # (e.g. a cut at y=68 next to a wall snapped to y=65), leaving a
+            # staircase between rooms. A second alignment pass clusters the new
+            # axis-aligned cut edges with those neighbouring coordinates
+            # (within snap_tol) and snaps them onto ONE shared line.
+            aligned = align_rooms(aligned, mask, angle_tol=args.angle_tol,
+                                  snap_tol=args.snap_tol,
+                                  collapse_diag_len=args.collapse_diag_len,
+                                  spike_angle_deg=args.spike_angle_deg,
+                                  spike_max_gap=args.spike_max_gap,
+                                  collinear_tol=args.collinear_tol,
+                                  wall_min_run=args.wall_min_run)
+            print('  re-aligned {} rooms after splitting'.format(len(aligned)))
+
     # 4) outputs
+    split_parents = {rec['parent'] for rec in splits}
     rooms_out = []
-    for r in aligned:
+    for i, r in enumerate(aligned):
         world = pixel_to_world(r, min_coords, max_coords, hflip=dst_hflip)
-        rooms_out.append({
+        room_out = {
             'pixel': r.astype(int).tolist(),
             'world_mm': world.tolist(),
             'world_m': (world / 1000.).tolist(),
-        })
+        }
+        if parent_ids[i] in split_parents:
+            room_out['split_from'] = parent_ids[i]     # pre-split room index
+        rooms_out.append(room_out)
     norm_out = dict(norm)
     norm_out['hflip'] = dst_hflip                          # record the emitted frame
     result = {
@@ -694,6 +1027,15 @@ def main(args):
             'collinear_tol_px': args.collinear_tol,
             'wall_min_run': args.wall_min_run,
             'hflip': dst_hflip,
+            'split_enabled': not args.no_split,
+            'split_band': [args.split_band_lo, args.split_band_hi],
+            'split_mask_percentile': args.split_mask_percentile,
+            'split_min_cover': args.split_min_cover,
+            'split_main_cover': args.split_main_cover,
+            'split_end_gap_px': args.split_end_gap,
+            'split_door_px': [args.split_door_min, args.split_door_max],
+            'split_min_size_px': args.split_min_size,
+            'splits': splits,
         },
     }
     json_path = os.path.join(out_dir, '{}_aligned_polys.json'.format(name))
@@ -708,14 +1050,20 @@ def main(args):
                           font_scale=1.4, thickness=3)      # black on pastel
     cv2.imwrite(os.path.join(out_dir, '{}_aligned_floorplan.png'.format(name)), floorplan)
     cv2.imwrite(os.path.join(out_dir, '{}_mask.png'.format(name)), (mask * 255).astype(np.uint8))
+    if struct_mask is not None:
+        cv2.imwrite(os.path.join(out_dir, '{}_split_mask.png'.format(name)),
+                    (struct_mask * 255).astype(np.uint8))
     save_density_hist(density, thr_u8, args.mask_method,
                       os.path.join(out_dir, '{}_density_hist.png'.format(name)))
     save_overlay(mask, aligned, os.path.join(out_dir, '{}_aligned_overlay.png'.format(name)),
                  label_rooms=not args.no_room_labels)
 
     print('Wrote:')
-    for suffix in ('_aligned_polys.json', '_aligned_floorplan.png', '_mask.png',
-                   '_density_hist.png', '_aligned_overlay.png'):
+    suffixes = ['_aligned_polys.json', '_aligned_floorplan.png', '_mask.png',
+                '_density_hist.png', '_aligned_overlay.png']
+    if struct_mask is not None:
+        suffixes.insert(3, '_split_mask.png')
+    for suffix in suffixes:
         print('  {}'.format(os.path.join(out_dir, name + suffix)))
 
 

@@ -84,8 +84,8 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
 ## 后处理：房间墙线对齐 / 消隙（align_floorplan.py）
 
 `align_floorplan.py`（包装 `tools/align_floorplan.sh`）把 `infer_pointcloud.py` 独立预测、
-彼此有缝且略倾斜的各房间墙线**对齐、消除房间间空隙、近轴墙拉正**。详见
-`docs/align_floorplan.md`。
+彼此有缝且略倾斜的各房间墙线**对齐、消除房间间空隙、近轴墙拉正**，并**细分被模型
+合并的房间**（split，默认开）。详见 `docs/align_floorplan.md`。
 
 - 输入：`{name}_polys.json` + 对应 `.ply`。
 - 原理：用 JSON 里存储的 `applied_yaw_deg`+`min/max_coords`（+ `hflip`）重建**与多边形逐像素对齐**的密度图
@@ -99,8 +99,22 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
   最后三层化简：连续重复点 → 近共线/回折点（到邻点连线垂距 ≤ `--collinear_tol 2`px，
   含浅回折缺口尖点）→ 锐角尖刺（内角 < `--spike_angle_deg 60` 且开口 ≤ `--spike_max_gap 10`px）。
   默认输出俯视帧（`hflip`），旧 JSON 自动转帧（见上第 4 点）；`--no_floor_hflip` 关闭。
+- **房间细分（split）**：对齐后用**贴顶带**（高度 `[--split_band_lo 0.75, --split_band_hi 0.95]`
+  分位段，实测安全区 lo∈[0.65,0.82]/hi∈[0.92,0.98]，避开天花板平面；墙到顶、家具/吧台
+  不到顶；门洞过梁点稀达不到阈值、与带无关，靠门洞感知缺口判据兜底）投影出第二张**结构墙 mask**
+  （`_split_mask.png`），检测房间内部隔墙并递归切开（shapely 半平面相交，两子房间共享
+  切割线坐标，零缝零重叠）。判据全部满足才下刀（宁漏勿误）：内部弦（线两侧各 ≥
+  `--split_min_size 8`px 深房间面积，1D 腐蚀；防房间自身台阶边界墙/飘窗前沿冒充）+
+  双端接界（≤ `--split_end_gap 3`px；拒独立烟道/柜线）+ 去噪覆盖率 ≥ `--split_min_cover 0.5`
+  + 门洞感知缺口（洞只能是 ≤2px 噪声×1 或 `[--split_door_min 7, --split_door_max 24]`px
+  门洞×1；3~6px 洞=淋浴隔断类假线，拒）+ **全高交叉验证**（同线在主 mask 去噪覆盖 ≥
+  `--split_main_cover 0.4`；窗帘盒只在贴顶带、到顶衣柜前脸在低处碎掉，均拒）。
+  子房间带 `split_from`（切割前下标），切割记录在 `align_info.splits`；**编号会移位**。
+  切割后**再跑一遍对齐吸附**：切割线是各房间独立取的 argmax，厚墙带上会与邻房已吸附
+  墙线差几像素成台阶，第二遍聚类把它们并到同一条共享墙线。
+  `--no_split` 关闭。星河湾实测 13→17 房间 4 刀全对、零误切。
 - 用法：`bash tools/align_floorplan.sh [polys.json] [ply] [out_dir]`。
-- 产出：`_aligned_polys.json`、`_aligned_floorplan.png`、`_mask.png`、`_density_hist.png`（排序密度曲线+阈值）、`_aligned_overlay.png`（墙线叠 mask 供核对）。floorplan/overlay 默认标注 room 序号（= `_aligned_polys.json` `rooms` 下标，两图一致；锚点用 `cv2.distanceTransform` 取离墙最远内点，L 形房间不出框），`--no_room_labels` 关闭。
+- 产出：`_aligned_polys.json`、`_aligned_floorplan.png`、`_mask.png`、`_split_mask.png`（贴顶带结构 mask）、`_density_hist.png`（排序密度曲线+阈值）、`_aligned_overlay.png`（墙线叠 mask 供核对）。floorplan/overlay 默认标注 room 序号（= `_aligned_polys.json` `rooms` 下标，两图一致；锚点用 `cv2.distanceTransform` 取离墙最远内点，L 形房间不出框），`--no_room_labels` 关闭。
 - 关键旋钮：`--snap_tol`（聚类容差，px）、`--angle_tol`（近轴判定，度）、`--mask_method otsu|knee|percentile`（otsu 双峰最干净；knee=排序曲线弦距膝点，阈值更宽松、墙更连续，弱墙断线时用）、`--collapse_diag_len`（连续斜边段总长 ≤ 此值则收成直角，消切角毛刺 **并拉直近轴短边防房间错位/overlap**；**默认 20**，0=关，吸附前后各跑一次，真斜墙段更长不受影响）、`--collinear_tol`（到邻点连线垂距 ≤ 此值删点，消近共线/浅回折缺口尖点，默认 2px）、`--wall_min_run`（吸附时只有 ≥ 此长度连续段的墙像素才算墙，拒绝断线/杂物列，默认 5）、`--crop_iqr_k/--pct_low/--pct_high`（须与生成 JSON 时一致）。
 - **点云→密度图的共享核心**在 `util/pointcloud.py`（`infer_pointcloud.py` 与本脚本共用，无 torch 依赖）。
 
