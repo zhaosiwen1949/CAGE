@@ -84,8 +84,9 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
 ## 后处理：房间墙线对齐 / 消隙（align_floorplan.py）
 
 `align_floorplan.py`（包装 `tools/align_floorplan.sh`）把 `infer_pointcloud.py` 独立预测、
-彼此有缝且略倾斜的各房间墙线**对齐、消除房间间空隙、近轴墙拉正**，并**细分被模型
-合并的房间**（split，默认开）。详见 `docs/align_floorplan.md`。
+彼此有缝且略倾斜的各房间墙线**对齐、消除房间间空隙、近轴墙拉正**，**细分被模型
+合并的房间**（split，默认开），并**识别内墙门/开口**（openings，默认开）。详见
+`docs/align_floorplan.md`。
 
 - 输入：`{name}_polys.json` + 对应 `.ply`。
 - 原理：用 JSON 里存储的 `applied_yaw_deg`+`min/max_coords`（+ `hflip`）重建**与多边形逐像素对齐**的密度图
@@ -113,10 +114,21 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
   切割后**再跑一遍对齐吸附**：切割线是各房间独立取的 argmax，厚墙带上会与邻房已吸附
   墙线差几像素成台阶，第二遍聚类把它们并到同一条共享墙线。
   `--no_split` 关闭。星河湾实测 13→17 房间 4 刀全对、零误切。
+- **门/开口识别（openings）**：对齐+细分后，对每条墙线逐位置统计**墙面板 ±`--wall_tol`** 内
+  四个高度带（`--zone_floor/low/mid/top`，占楼面→天花跨度分位；楼面/天花用直方图峰
+  `estimate_floor_ceiling` 定标）+ **墙前方**中段点数，分五类 W墙/S窗台/O遮挡/D通透门洞/U无数据。
+  门/开口 = 连续非 W 段。关键判据：**run 级过梁判据**（整段 top-ratio 最小值 < `--top_open_thr 0.12`
+  才算真开口——实墙中段扫描空洞上方处处有墙、min top 偏高被拒；逐位置 top 会重叠，靠 run 级最小值分开）；
+  floor 用**绝对计数** `--floor_min_pts` 判「被扫到过」（门洞地板比墙暗，相对阈值会误判无数据）；
+  占据用**相对阈值** `--open_rel_thr 0.35`×该线墙水平（弱墙/窗帘/门框漏点按比例区分）；
+  **外墙洞口默认丢弃**（`wall_is_exterior` 两侧房间栅格测试，比数房间边可靠；`--keep_exterior_openings` 保留）；
+  **连通性兜底** `ensure_connectivity`（`--no_ensure_connectivity` 关闭）：某房被严格判据判成孤岛时
+  按证据在其共享墙补一扇门（标 `recovered`），保证每房 ≥1 门。窗全在外墙、本版整体不输出，后续单独做。
+  `--no_openings` 关闭。星河湾实测 15 门 + 1 垭口、外墙洞口 0、卧室B 边界真门由连通性补回。
 - 用法：`bash tools/align_floorplan.sh [polys.json] [ply] [out_dir]`。
-- 产出：`_aligned_polys.json`、`_aligned_floorplan.png`、`_mask.png`、`_split_mask.png`（贴顶带结构 mask）、`_density_hist.png`（排序密度曲线+阈值）、`_aligned_overlay.png`（墙线叠 mask 供核对）。floorplan/overlay 默认标注 room 序号（= `_aligned_polys.json` `rooms` 下标，两图一致；锚点用 `cv2.distanceTransform` 取离墙最远内点，L 形房间不出框），`--no_room_labels` 关闭。
+- 产出：`_aligned_polys.json`（另含顶层 `openings` + `openings_undecided`）、`_aligned_floorplan.png`、`_mask.png`、`_split_mask.png`（贴顶带结构 mask）、`_density_hist.png`（排序密度曲线+阈值）、`_aligned_overlay.png`（墙线叠 mask 供核对）、`_openings.png`（门/开口 + 逐位置竖直剖面分类）。floorplan/overlay 默认标注 room 序号（= `_aligned_polys.json` `rooms` 下标，两图一致；锚点用 `cv2.distanceTransform` 取离墙最远内点，L 形房间不出框），`--no_room_labels` 关闭。
 - 关键旋钮：`--snap_tol`（聚类容差，px）、`--angle_tol`（近轴判定，度）、`--mask_method otsu|knee|percentile`（otsu 双峰最干净；knee=排序曲线弦距膝点，阈值更宽松、墙更连续，弱墙断线时用）、`--collapse_diag_len`（连续斜边段总长 ≤ 此值则收成直角，消切角毛刺 **并拉直近轴短边防房间错位/overlap**；**默认 20**，0=关，吸附前后各跑一次，真斜墙段更长不受影响）、`--collinear_tol`（到邻点连线垂距 ≤ 此值删点，消近共线/浅回折缺口尖点，默认 2px）、`--wall_min_run`（吸附时只有 ≥ 此长度连续段的墙像素才算墙，拒绝断线/杂物列，默认 5）、`--crop_iqr_k/--pct_low/--pct_high`（须与生成 JSON 时一致）。
-- **点云→密度图的共享核心**在 `util/pointcloud.py`（`infer_pointcloud.py` 与本脚本共用，无 torch 依赖）。
+- **点云→密度图的共享核心**在 `util/pointcloud.py`（`infer_pointcloud.py` 与本脚本共用，无 torch 依赖）；门/开口识别新增两个通用原语也在此：`float_pixels`（逐点浮点像素坐标，density_fixed_norm 的逐点版）、`estimate_floor_ceiling`（直方图峰定楼面/天花高度）。
 
 ## ⚠️ 单位注意
 

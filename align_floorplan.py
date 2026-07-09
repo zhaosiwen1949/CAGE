@@ -29,10 +29,16 @@ Pipeline:
      whole room chord and reach both boundaries -- so single rooms with tall
      clutter (kitchen duct/cabinets) are never split. Recursive; --no_split
      turns it off.
-  6. Re-project the snapped pixels to world coords and write:
+  6. Openings: classify every wall position by the VERTICAL distribution of
+     points at the wall plane (and in front of it) into wall / sill / occluded /
+     open-doorway / no-data, then read off doors and passages as the open runs.
+     Exterior openings are dropped (this pass keeps interior doors/passages);
+     a connectivity backstop guarantees every room reaches a neighbour. See the
+     detect_openings section below. --no_openings turns it off.
+  7. Re-project the snapped pixels to world coords and write:
        {name}_aligned_polys.json, {name}_aligned_floorplan.png,
        {name}_mask.png, {name}_split_mask.png, {name}_density_hist.png,
-       {name}_aligned_overlay.png
+       {name}_aligned_overlay.png, {name}_openings.png
 
 This script has NO torch / model dependency; it only reuses the point-cloud ->
 density pipeline from util.pointcloud (shared with infer_pointcloud.py).
@@ -49,11 +55,15 @@ import matplotlib
 matplotlib.use('Agg')                                       # headless / no display
 import matplotlib.pyplot as plt                             # noqa: E402
 
+from matplotlib.patches import Polygon as MplPolygon         # noqa: E402
+
 from util.plot_utils import plot_floorplan_with_regions     # noqa: E402
 from util.pointcloud import (                               # noqa: E402
     rotate_floor_plane,
     preprocess_xyz,
     density_fixed_norm,
+    float_pixels,
+    estimate_floor_ceiling,
     pixel_to_world,
     floor_hflip_needed,
 )
@@ -176,6 +186,59 @@ def get_args_parser():
     parser.add_argument('--split_min_size', default=8, type=int,
                         help="Minimum bbox side (px) of every sub-room a cut produces; "
                              "cuts creating thinner slivers are rejected.")
+
+    # --- Opening (door / passage) detection, from per-position vertical profiles
+    parser.add_argument('--no_openings', action='store_true',
+                        help="Skip door / passage detection (openings are detected "
+                             "by default and written to _aligned_polys.json + "
+                             "_openings.png).")
+    # Height zones as fractions of the detected floor->ceiling span (~2.7 m). The
+    # floor-plane noise tail reaches ~0.18, so the sill zone starts at 0.20.
+    parser.add_argument('--zone_floor', nargs=2, type=float, default=[-0.08, 0.18],
+                        help="Floor-plane band: seeing the floor through a gap proves "
+                             "the position was scanned (open doorway).")
+    parser.add_argument('--zone_low', nargs=2, type=float, default=[0.20, 0.33],
+                        help="Sill band: wall here but open above = window/sill.")
+    parser.add_argument('--zone_mid', nargs=2, type=float, default=[0.40, 0.72],
+                        help="Mid band: doors, windows and passages are all open here.")
+    parser.add_argument('--zone_top', nargs=2, type=float, default=[0.78, 0.96],
+                        help="Lintel band (below the ceiling plane).")
+    parser.add_argument('--wall_tol', default=1.5, type=float,
+                        help="Half-width (px) of the wall-plane slab (~0.15 m).")
+    parser.add_argument('--front_tol', default=5.0, type=float,
+                        help="Furniture-in-front search half-width (px) for occlusion.")
+    parser.add_argument('--open_rel_thr', default=0.35, type=float,
+                        help="A band counts as occupied at >= this fraction of the wall "
+                             "line's own wall level (75th pct of mid-band density). "
+                             "Relative, so weak walls / curtains / frame-leakage separate "
+                             "by ratio not absolute count.")
+    parser.add_argument('--open_min_pts', default=5, type=int,
+                        help="A (position, band) cell below this many points is empty.")
+    parser.add_argument('--open_min_wall_dens', default=60.0, type=float,
+                        help="Minimum wall level for a line to be judged; weaker lines "
+                             "are all no-data.")
+    parser.add_argument('--top_open_thr', default=0.12, type=float,
+                        help="A real opening is open to the ceiling SOMEWHERE (per-run "
+                             "minimum top-band ratio below this). A solid wall with only "
+                             "a mid-height scan gap keeps wall above along the whole run "
+                             "and is rejected. Real doorways dip to ~0.08, wall gaps stay "
+                             ">=0.16; 0.12 sits in that gap.")
+    parser.add_argument('--floor_min_pts', default=5, type=int,
+                        help="Absolute floor-band count proving a position was scanned "
+                             "(open doorway). Absolute because doorway floor is dimmer "
+                             "than a wall and would fail a relative test.")
+    parser.add_argument('--open_hole_min', default=6, type=int,
+                        help="Minimum opening width (px, ~0.6 m) to report.")
+    parser.add_argument('--door_min', default=7, type=int,
+                        help="Openings in [door_min, door_max] px are doors; wider ones "
+                             "are passages / openings.")
+    parser.add_argument('--door_max', default=24, type=int)
+    parser.add_argument('--keep_exterior_openings', action='store_true',
+                        help="Keep openings on exterior walls (dropped by default; this "
+                             "pass focuses on interior doors/passages).")
+    parser.add_argument('--no_ensure_connectivity', action='store_true',
+                        help="Do not recover a door for rooms left with no interior "
+                             "opening (connectivity backstop is on by default).")
 
     parser.add_argument('--no_room_labels', action='store_true',
                         help="Do not draw room index numbers on the floorplan / overlay "
@@ -821,6 +884,367 @@ def split_rooms(rooms_px, struct_mask, main_mask, min_cover=0.5, main_cover=0.4,
 
 
 # ---------------------------------------------------------------------------
+# Opening (door / passage) detection via per-position vertical profiles
+#
+# The 2-D masks above cannot tell a doorway from an occluded / never-scanned
+# wall stretch: both are empty at mid height. So openings are found from the
+# VERTICAL distribution of points AT each wall position. For each position we
+# count points at the wall plane (+-wall_tol px) in four height bands and count
+# points just IN FRONT of the wall, then classify (see CLASS_MEANING):
+#   W wall      mid band occupied at the wall plane
+#   S sill      low occupied, mid empty (window / furniture-behind-a-door)
+#   O occluded  wall plane empty but furniture in front at mid height -> wall
+#   D doorway   wall plane empty low+mid, floor visible (position was scanned)
+#   U no-data   nothing anywhere: never scanned, NOT evidence of a door
+# Openings are the maximal non-W runs; a run is a real opening only if it opens
+# to the ceiling somewhere (per-run min top-ratio < top_open_thr), which
+# separates real doors from a solid wall that merely lost its mid-height band.
+# ---------------------------------------------------------------------------
+CLS = {'W': 0, 'S': 1, 'O': 2, 'D': 3, 'U': 4}
+CLASS_MEANING = {'W': 'wall', 'S': 'sill', 'O': 'occluded', 'D': 'doorway',
+                 'U': 'no-data'}
+
+
+def runs_of(profile, value):
+    """List of (start, end_exclusive) runs where profile == value."""
+    p = (np.asarray(profile) == value).astype(np.int8)
+    d = np.diff(np.concatenate(([0], p, [0])))
+    return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
+
+
+def collect_wall_lines(rooms_px, line_tol=1):
+    """Group axis-aligned polygon edges into shared wall lines.
+
+    Returns a list of {axis: 'x'|'y', line: int, members: [(room, a, b)]} where
+    a<=b is each edge's extent along the wall. Edges of different rooms on the
+    same line (within line_tol) share one group, so a wall between two rooms is
+    scanned once. Diagonal edges (bay-window arcs) are skipped -- out of scope.
+    """
+    edges = {'x': [], 'y': []}                     # axis -> [(line, a, b, room)]
+    for ridx, poly in enumerate(rooms_px):
+        m = len(poly)
+        for k in range(m):
+            p, q = poly[k], poly[(k + 1) % m]
+            if p[0] == q[0] and p[1] != q[1]:      # vertical edge -> shares an x
+                a, b = sorted((int(p[1]), int(q[1])))
+                edges['x'].append((int(p[0]), a, b, ridx))
+            elif p[1] == q[1] and p[0] != q[0]:    # horizontal edge -> shares a y
+                a, b = sorted((int(p[0]), int(q[0])))
+                edges['y'].append((int(p[1]), a, b, ridx))
+    groups = []
+    for axis in ('x', 'y'):
+        es = sorted(edges[axis])
+        used = [False] * len(es)
+        for i, (line, a, b, r) in enumerate(es):
+            if used[i]:
+                continue
+            member = [(r, a, b)]
+            used[i] = True
+            for j in range(i + 1, len(es)):
+                lj, aj, bj, rj = es[j]
+                if lj - line > line_tol:
+                    break
+                if not used[j]:
+                    member.append((rj, aj, bj))
+                    used[j] = True
+            groups.append({'axis': axis, 'line': int(line), 'members': member})
+    return groups
+
+
+def build_label_raster(rooms_px, res=256):
+    """Room-id raster: lab[row, col] = room index, or -1 for empty space."""
+    lab = np.full((res, res), -1, dtype=np.int16)
+    for i, p in enumerate(rooms_px):
+        m = np.zeros((res, res), dtype=np.uint8)
+        cv2.fillPoly(m, [p.reshape(-1, 1, 2)], 1)
+        lab[m > 0] = i
+    return lab
+
+
+def wall_is_exterior(lab, axis, line, s, e, offs=(2, 3, 4), cov_thr=0.5):
+    """True if a wall span borders empty space on at least one perpendicular side.
+
+    Samples the room raster a few px off the wall on both sides over [s, e]; if
+    either side's room-coverage fraction is below cov_thr the wall is on the
+    building's outer boundary. Robust where counting overlapping room edges is
+    not: two stacked rooms' edges can land on one line yet the wall is still
+    exterior because the far side is empty.
+    """
+    H, W = lab.shape
+    left, right = [], []
+    for t in range(s, e + 1):
+        if not (0 <= t < (H if axis == 'x' else W)):
+            continue
+        for dd in offs:
+            if axis == 'x':
+                left.append(lab[t, max(0, line - dd)] >= 0)
+                right.append(lab[t, min(W - 1, line + dd)] >= 0)
+            else:
+                left.append(lab[max(0, line - dd), t] >= 0)
+                right.append(lab[min(H - 1, line + dd), t] >= 0)
+    lc = float(np.mean(left)) if left else 0.0
+    rc = float(np.mean(right)) if right else 0.0
+    return (lc < cov_thr) or (rc < cov_thr)
+
+
+def classify_positions(zone_dens, zone_cnt, front_dens, front_cnt,
+                       rel_thr, min_pts, min_wall_dens, floor_min_pts):
+    """Classify each wall position W/S/O/D/U; also return per-position top-ratio.
+
+    zone_dens / zone_cnt: (n_pos, 4) for [floor, low, mid, top] (density = count
+    / band height-fraction); front_*: (n_pos,) mid-band points in front of the
+    wall. Occupancy is judged RELATIVE to the line's own wall level (75th pct of
+    mid-band density) so weakly scanned walls, curtains and frame leakage
+    separate by ratio, not absolute counts.
+
+    top_ratio (top-band density / wall level) is used at RUN level by the
+    caller: position-level top does not separate real doors from wall scan gaps,
+    but a run's MINIMUM top-ratio does (a doorway opens to the ceiling somewhere,
+    a wall gap keeps wall above throughout). Priority: mid->W, low->S,
+    front->O, floor-scanned(absolute)->D, else U.
+    """
+    n = zone_dens.shape[0]
+    wall_level = float(np.percentile(zone_dens[:, 2], 75))
+    if wall_level < min_wall_dens:
+        return 'U' * n, np.zeros(n)
+    thr = rel_thr * wall_level
+    top_ratio = zone_dens[:, 3] / wall_level
+    occ = (zone_dens >= thr) & (zone_cnt >= min_pts)
+    floor_scanned = zone_cnt[:, 0] >= floor_min_pts
+    fr = (front_dens >= thr) & (front_cnt >= min_pts)
+    out = []
+    for i in range(n):
+        _, low_o, mid_o, _ = occ[i]
+        if mid_o:
+            out.append('W')
+        elif low_o:
+            out.append('S')
+        elif fr[i]:
+            out.append('O')
+        elif floor_scanned[i]:
+            out.append('D')
+        else:
+            out.append('U')
+    return ''.join(out), top_ratio
+
+
+def detect_openings(rooms_px, xyz_rot, hfrac, min_coords, max_coords, image_res,
+                    hflip, args):
+    """Detect interior doors / passages from per-position vertical profiles.
+
+    Returns (openings, walls_debug, undecided). `openings` are interior doors /
+    passages (exterior dropped unless args.keep_exterior_openings). `undecided`
+    are pure no-data interior spans, kept only for the debug figure. `hfrac` is
+    the height of every point as a fraction of the floor->ceiling span.
+    """
+    res = int(image_res[0])
+    fcol, frow = float_pixels(xyz_rot, min_coords, max_coords, res, hflip)
+    px2m = float((max_coords[0] - min_coords[0]) / (res - 1))
+    lab = build_label_raster(rooms_px, res=res)
+    groups = collect_wall_lines(rooms_px, line_tol=1)
+    zones = [args.zone_floor, args.zone_low, args.zone_mid, args.zone_top]
+
+    # pre-sort point indices by integer col and row for fast per-line slab gather
+    icol = np.round(fcol).astype(np.int32)
+    irow = np.round(frow).astype(np.int32)
+    order_c, order_r = np.argsort(icol, kind='stable'), np.argsort(irow, kind='stable')
+    col_sorted, row_sorted = icol[order_c], irow[order_r]
+
+    def gather(axis, lo, hi):
+        """Indices of points whose perpendicular integer coord is in [lo, hi]."""
+        if axis == 'x':
+            i0, i1 = np.searchsorted(col_sorted, [lo, hi + 1])
+            return order_c[i0:i1]
+        i0, i1 = np.searchsorted(row_sorted, [lo, hi + 1])
+        return order_r[i0:i1]
+
+    openings, walls_debug, undecided = [], [], []
+    for g in groups:
+        axis, line = g['axis'], g['line']
+        a = min(m[1] for m in g['members'])
+        b = max(m[2] for m in g['members'])
+        n = b - a + 1
+        if n < 2 * args.wall_min_run:
+            continue
+        perp = fcol if axis == 'x' else frow
+        along = frow if axis == 'x' else fcol
+
+        wt, ft = args.wall_tol, args.front_tol
+        cand = gather(axis, int(np.floor(line - ft)), int(np.ceil(line + ft)))
+        d = np.abs(perp[cand] - line)
+        pos = np.round(along[cand]).astype(np.int32) - a
+        inside = (pos >= 0) & (pos < n)
+        hf = hfrac[cand]
+
+        # count wall-plane points per position per height band
+        zone_cnt = np.zeros((n, 4), dtype=np.int32)
+        wall_sel = inside & (d <= wt)
+        for zi, (f0, f1) in enumerate(zones):
+            zsel = wall_sel & (hf >= f0) & (hf <= f1)
+            np.add.at(zone_cnt[:, zi], pos[zsel], 1)
+        # count mid-band points just IN FRONT of the wall (occlusion evidence)
+        front_cnt = np.zeros(n, dtype=np.int32)
+        fsel = (inside & (d > wt) & (d <= ft)
+                & (hf >= args.zone_mid[0]) & (hf <= args.zone_mid[1]))
+        np.add.at(front_cnt, pos[fsel], 1)
+
+        band_h = np.array([f1 - f0 for f0, f1 in zones])
+        zone_dens = zone_cnt / band_h[None, :]
+        # front slab is wider than the wall slab: rescale to per-slab-width density
+        front_dens = (front_cnt / (args.zone_mid[1] - args.zone_mid[0])
+                      * (2 * wt) / (2 * (ft - wt)))
+        cls, top_ratio = classify_positions(
+            zone_dens, zone_cnt, front_dens, front_cnt, args.open_rel_thr,
+            args.open_min_pts, args.open_min_wall_dens, args.floor_min_pts)
+
+        cover_rooms = np.zeros(n, dtype=np.int8)       # how many room edges cover pos
+        for r, ma, mb in g['members']:
+            cover_rooms[ma - a:mb - a + 1] += 1
+
+        walls_debug.append({'axis': axis, 'line': int(line),
+                            'span': [int(a), int(b)],
+                            'rooms': sorted({m[0] for m in g['members']}),
+                            'classes': cls})
+
+        arr = np.array([CLS[c] for c in cls])
+        if (arr == CLS['W']).sum() < args.wall_min_run:
+            continue                                    # no wall on this line at all
+        for s, e in runs_of((arr == CLS['W']).astype(np.int8), 0):
+            w = e - s
+            if w < args.open_hole_min:
+                continue
+            if cover_rooms[s:e].min() < 1:
+                continue                                # not on any room's edge
+            sub = arr[s:e]
+            frac = {k: float((sub == v).mean()) for k, v in CLS.items()}
+            if frac['O'] >= 0.5:
+                continue                                # occluded wall, not an opening
+            # run-level lintel test: a genuine opening is open to the ceiling
+            # SOMEWHERE; a solid wall with only a mid-height scan gap keeps wall
+            # above along the whole run (min top-ratio stays high) -> reject.
+            if float(top_ratio[s:e].min()) >= args.top_open_thr:
+                continue
+            exterior = wall_is_exterior(lab, axis, line, a + s, a + e - 1)
+            rooms_here = sorted({r for r, ma, mb in g['members']
+                                 if not (mb < a + s or ma > a + e - 1)})
+            geom = {'axis': axis, 'line': int(line),
+                    'span': [int(a + s), int(a + e - 1)],
+                    'width_px': int(w), 'width_m': round(w * px2m, 2),
+                    'rooms': rooms_here, 'exterior': bool(exterior),
+                    'classes': cls[s:e]}
+
+            if frac['U'] >= 0.6:
+                undecided.append(geom)                  # never scanned: keep for debug only
+                continue
+            if exterior and not args.keep_exterior_openings:
+                continue                                # this pass: interior only
+            # interior S-dominant is NOT a window (no interior windows in a flat):
+            # the "sill" is furniture right behind a door -> classify as a door.
+            kind = 'door' if w <= args.door_max else 'passage'
+            openings.append({'type': kind, **geom})
+    return openings, walls_debug, undecided
+
+
+def _side_room(lab, axis, line, pos, side, offs=(2, 3, 4)):
+    """Most common room id `side` px off the wall at `pos` (-1 = empty space)."""
+    H, W = lab.shape
+    vals = []
+    for dd in offs:
+        c = line + side * dd
+        if axis == 'x':
+            vals.append(int(lab[min(max(pos, 0), H - 1), min(max(c, 0), W - 1)]))
+        else:
+            vals.append(int(lab[min(max(c, 0), H - 1), min(max(pos, 0), W - 1)]))
+    vals = [v for v in vals if v >= 0]
+    return max(set(vals), key=vals.count) if vals else -1
+
+
+def ensure_connectivity(openings, walls_debug, rooms_px, lab, args, px2m):
+    """Guarantee every room has >=1 interior opening to another room.
+
+    A room isolated by the strict filtering (all its wall gaps read as wall, or
+    its only opening was pure no-data) gets one door recovered: the best-scoring
+    non-wall run on a wall it shares with a neighbour, scored by how open it
+    looks (D through-floor > U no-data > S sill) and door-width fit. A room whose
+    shared walls are entirely wall gets a nominal door at the midpoint of its
+    longest shared wall. Recovered doors carry recovered='connectivity'|'nominal'.
+    Returns the list of recovered openings (also appended to `openings`).
+    """
+    n = len(rooms_px)
+    adj = {i: set() for i in range(n)}
+    for op in openings:
+        for i in op['rooms']:
+            for j in op['rooms']:
+                if i != j:
+                    adj[i].add(j)
+
+    recovered = []
+    for r in range(n):
+        if adj[r]:
+            continue
+        best = None                                    # (score, axis, line, s, e, w, other, how)
+        for wd in walls_debug:
+            if r not in wd['rooms']:
+                continue
+            axis, line, a = wd['axis'], wd['line'], wd['span'][0]
+            arr = np.array([CLS[c] for c in wd['classes']])
+            for s, e in runs_of((arr == CLS['W']).astype(np.int8), 0):
+                w = e - s
+                if w < args.open_hole_min:
+                    continue
+                mid = a + (s + e) // 2
+                sides = {_side_room(lab, axis, line, mid, -1),
+                         _side_room(lab, axis, line, mid, +1)}
+                if r not in sides:
+                    continue
+                other = sorted(x for x in sides if x >= 0 and x != r)
+                if not other:
+                    continue                           # exterior side; need a neighbour
+                sub = arr[s:e]
+                fD = float((sub == CLS['D']).mean())
+                fU = float((sub == CLS['U']).mean())
+                fS = float((sub == CLS['S']).mean())
+                fit = 1.0 if args.door_min <= w <= args.door_max else 0.4
+                score = (fD + 0.5 * fU + 0.3 * fS) * fit
+                how = 'connectivity' if (fD > 0 or fS > 0) else 'nominal'
+                if best is None or score > best[0]:
+                    best = (score, axis, line, a + s, a + e - 1, w, other[0], how)
+        if best is None:
+            # no openable run anywhere: nominal door at the longest shared wall
+            longest = None
+            for wd in walls_debug:
+                if r not in wd['rooms'] or len(set(wd['rooms'])) < 2:
+                    continue
+                a, b = wd['span']
+                if longest is None or (b - a) > (longest[3] - longest[2]):
+                    longest = (wd['axis'], wd['line'], a, b)
+            if longest is None:
+                print('  ! room {} shares no interior wall; cannot recover'.format(r))
+                continue
+            axis, line, a, b = longest
+            mid, hw = (a + b) // 2, args.door_min // 2
+            other = sorted(x for x in {_side_room(lab, axis, line, mid, -1),
+                                       _side_room(lab, axis, line, mid, +1)}
+                           if x >= 0 and x != r)
+            best = (0.0, axis, line, mid - hw, mid + hw, args.door_min,
+                    other[0] if other else -1, 'nominal')
+
+        score, axis, line, s_abs, e_abs, w, other, how = best
+        op = {'type': 'door', 'recovered': how, 'axis': axis, 'line': int(line),
+              'span': [int(s_abs), int(e_abs)], 'width_px': int(w),
+              'width_m': round(w * px2m, 2),
+              'rooms': sorted({r, other}) if other >= 0 else [r], 'exterior': False}
+        openings.append(op)
+        recovered.append(op)
+        adj[r].add(other)
+        if other >= 0:
+            adj[other].add(r)
+        print('  + room {} isolated -> recovered {} door {}={} {}..{} '
+              '(links room {})'.format(r, how, axis, line, s_abs, e_abs, other))
+    return recovered
+
+
+# ---------------------------------------------------------------------------
 # Debug figure
 # ---------------------------------------------------------------------------
 def save_density_hist(density, thr_u8, method, out_path):
@@ -892,6 +1316,73 @@ def save_overlay(mask, rooms_px, out_path, scale=3, label_rooms=True):
                           fill=(0, 255, 255), halo=(0, 0, 0),
                           font_scale=0.9, thickness=2)      # yellow on dark
     cv2.imwrite(out_path, canvas)
+
+
+_OPEN_COLORS = {'door': '#ff3b30', 'passage': '#00d26a'}
+_CLS_RGB = {'W': (60, 60, 60), 'S': (58, 122, 254), 'O': (255, 165, 0),
+            'D': (255, 59, 48), 'U': (200, 200, 200)}
+
+
+def save_openings_debug(rooms_px, openings, walls_debug, undecided, out_path,
+                        res=256):
+    """Two-panel QA figure: detected openings (left) and the per-position
+    vertical classification of every wall (right)."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8.6))
+
+    ax = axes[0]
+    for ridx, poly in enumerate(rooms_px):
+        ax.add_patch(MplPolygon(poly, closed=True, fill=False,
+                                edgecolor='0.55', linewidth=1.2))
+        ax.annotate(str(ridx), poly.mean(axis=0), color='0.4', fontsize=9,
+                    ha='center', va='center')
+    for op in undecided:                               # no-scan-data spans
+        (s, e), line = op['span'], op['line']
+        xy = ([line, line], [s, e]) if op['axis'] == 'x' else ([s, e], [line, line])
+        ax.plot(*xy, color='#9e9e9e', linewidth=2.5, linestyle=(0, (2, 2)),
+                solid_capstyle='butt')
+    for i, op in enumerate(openings):
+        (s, e), line = op['span'], op['line']
+        xy = ([line, line], [s, e]) if op['axis'] == 'x' else ([s, e], [line, line])
+        recovered = 'recovered' in op
+        color = '#d400d4' if recovered else _OPEN_COLORS[op['type']]
+        ls = (0, (1, 1)) if recovered else '-'
+        ax.plot(*xy, color=color, linewidth=4, linestyle=ls, solid_capstyle='butt')
+        tx, ty = (line, (s + e) / 2) if op['axis'] == 'x' else ((s + e) / 2, line)
+        ax.annotate(str(i), (tx, ty), color=color, fontsize=7, fontweight='bold',
+                    ha='left', va='bottom')
+    handles = [plt.Line2D([0], [0], color=_OPEN_COLORS['door'], lw=4, label='door'),
+               plt.Line2D([0], [0], color=_OPEN_COLORS['passage'], lw=4, label='passage'),
+               plt.Line2D([0], [0], color='#d400d4', lw=4, ls=(0, (1, 1)), label='recovered'),
+               plt.Line2D([0], [0], color='#9e9e9e', lw=2.5, ls=(0, (2, 2)), label='no-data')]
+    ax.legend(handles=handles, loc='lower left', fontsize=9)
+    ax.set_title('detected openings (index = list order)')
+    ax.set_xlim(8, res - 8); ax.set_ylim(res - 8, 16)
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_aspect('equal')
+
+    ax = axes[1]
+    canvas = np.full((res, res, 3), 255, dtype=np.uint8)
+    for wd in walls_debug:
+        a = wd['span'][0]
+        for i, ch in enumerate(wd['classes']):
+            if wd['axis'] == 'x':
+                canvas[a + i, wd['line']] = _CLS_RGB[ch]
+            else:
+                canvas[wd['line'], a + i] = _CLS_RGB[ch]
+    ax.imshow(canvas, interpolation='nearest')
+    for poly in rooms_px:
+        ax.add_patch(MplPolygon(poly, closed=True, fill=False,
+                                edgecolor='0.8', linewidth=0.5))
+    handles = [plt.Line2D([0], [0], color=np.array(c) / 255, lw=4,
+                          label='{} {}'.format(k, CLASS_MEANING[k]))
+               for k, c in _CLS_RGB.items()]
+    ax.legend(handles=handles, loc='lower left', fontsize=8)
+    ax.set_title('per-position vertical classification')
+    ax.set_xlim(8, res - 8); ax.set_ylim(res - 8, 16)
+    ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle('door / passage detection (wall-plane vertical profiles)', fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=160, facecolor='white')
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1486,27 @@ def main(args):
                                   wall_min_run=args.wall_min_run)
             print('  re-aligned {} rooms after splitting'.format(len(aligned)))
 
+    # 3c) openings: detect interior doors / passages from per-position vertical
+    #     profiles of the point cloud at each (final) wall, then guarantee every
+    #     room reaches a neighbour.
+    openings, undecided, walls_dbg = [], [], []
+    if not args.no_openings:
+        res = int(image_res[0])
+        h = xyz[:, 2]
+        floor_h, ceil_h, span_h = estimate_floor_ceiling(h)
+        hfrac = (h - floor_h) / span_h                 # 0 = floor plane, 1 = ceiling
+        px2m = float((max_coords[0] - min_coords[0]) / (res - 1))
+        openings, walls_dbg, undecided = detect_openings(
+            aligned, xyz, hfrac, min_coords, max_coords, image_res, dst_hflip, args)
+        recovered = []
+        if not args.no_ensure_connectivity:
+            lab = build_label_raster(aligned, res=res)
+            recovered = ensure_connectivity(openings, walls_dbg, aligned, lab,
+                                            args, px2m)
+        n_doors = sum(1 for o in openings if o['type'] == 'door')
+        print('  openings: {} doors, {} passages ({} recovered for connectivity)'
+              .format(n_doors, len(openings) - n_doors, len(recovered)))
+
     # 4) outputs
     split_parents = {rec['parent'] for rec in splits}
     rooms_out = []
@@ -1036,7 +1548,16 @@ def main(args):
             'split_door_px': [args.split_door_min, args.split_door_max],
             'split_min_size_px': args.split_min_size,
             'splits': splits,
+            'openings_enabled': not args.no_openings,
+            'open_zones': {'floor': args.zone_floor, 'low': args.zone_low,
+                           'mid': args.zone_mid, 'top': args.zone_top},
+            'open_rel_thr': args.open_rel_thr,
+            'top_open_thr': args.top_open_thr,
+            'open_door_px': [args.door_min, args.door_max],
+            'openings_keep_exterior': args.keep_exterior_openings,
         },
+        'openings': openings,
+        'openings_undecided': undecided,               # no-scan-data spans (QA only)
     }
     json_path = os.path.join(out_dir, '{}_aligned_polys.json'.format(name))
     with open(json_path, 'w') as f:
@@ -1057,12 +1578,18 @@ def main(args):
                       os.path.join(out_dir, '{}_density_hist.png'.format(name)))
     save_overlay(mask, aligned, os.path.join(out_dir, '{}_aligned_overlay.png'.format(name)),
                  label_rooms=not args.no_room_labels)
+    if not args.no_openings:
+        save_openings_debug(aligned, openings, walls_dbg, undecided,
+                            os.path.join(out_dir, '{}_openings.png'.format(name)),
+                            res=int(image_res[0]))
 
     print('Wrote:')
     suffixes = ['_aligned_polys.json', '_aligned_floorplan.png', '_mask.png',
                 '_density_hist.png', '_aligned_overlay.png']
     if struct_mask is not None:
         suffixes.insert(3, '_split_mask.png')
+    if not args.no_openings:
+        suffixes.append('_openings.png')
     for suffix in suffixes:
         print('  {}'.format(os.path.join(out_dir, name + suffix)))
 

@@ -246,6 +246,48 @@ def density_fixed_norm(xyz_rot, min_coords, max_coords, image_res=(256, 256), hf
     return density
 
 
+def float_pixels(xyz_rot, min_coords, max_coords, image_res=256, hflip=False):
+    """Un-rounded pixel (col, row) of every point -- the per-point analog of the
+    binning inside density_fixed_norm.
+
+    Where density_fixed_norm accumulates rounded coords into a grid, this keeps
+    the fractional coordinate of each point so callers can gather the points that
+    fall within a sub-pixel slab around a wall line (used by the opening
+    detector, which needs the actual point heights at a wall, not a raster).
+    The transform matches density_fixed_norm exactly: after ps = -xyz with
+    ps[:,0], ps[:,1] re-negated, ps[:,0]=+x -> col and ps[:,1]=+y -> row; hflip
+    mirrors columns (255 - col) to match the flipped top-down map.
+    """
+    fcol = ((xyz_rot[:, 0] - min_coords[0])
+            / (max_coords[0] - min_coords[0]) * image_res)
+    frow = ((xyz_rot[:, 1] - min_coords[1])
+            / (max_coords[1] - min_coords[1]) * image_res)
+    if hflip:
+        fcol = (image_res - 1) - fcol
+    return fcol, frow
+
+
+def estimate_floor_ceiling(heights, bins=100, zone_frac=0.3):
+    """Locate the floor and ceiling plane heights as histogram peaks.
+
+    Both planes are flat and dense, so they dominate the height histogram. We
+    take the tallest bin in the bottom `zone_frac` of the range as the floor and
+    the tallest in the top `zone_frac` as the ceiling. This is more stable than
+    raw min/max (which chase the percentile-crop noise tails) and gives a
+    per-scene vertical reference so height bands can be expressed as fractions of
+    the true floor->ceiling span. Returns (floor_h, ceil_h, span).
+    """
+    h = np.asarray(heights)
+    hist, edges = np.histogram(h, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    rng = h.max() - h.min()
+    lo_zone = centers < h.min() + zone_frac * rng
+    hi_zone = centers > h.max() - zone_frac * rng
+    floor_h = float(centers[lo_zone][np.argmax(hist[lo_zone])])
+    ceil_h = float(centers[hi_zone][np.argmax(hist[hi_zone])])
+    return floor_h, ceil_h, ceil_h - floor_h
+
+
 def pixel_to_world(poly_px, min_coords, max_coords, hflip=False):
     """Inverse-project 256-space pixel corners to world (density-projection frame).
 
