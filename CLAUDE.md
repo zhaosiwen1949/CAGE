@@ -130,6 +130,43 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
 - 关键旋钮：`--snap_tol`（聚类容差，px）、`--angle_tol`（近轴判定，度）、`--mask_method otsu|knee|percentile`（otsu 双峰最干净；knee=排序曲线弦距膝点，阈值更宽松、墙更连续，弱墙断线时用）、`--collapse_diag_len`（连续斜边段总长 ≤ 此值则收成直角，消切角毛刺 **并拉直近轴短边防房间错位/overlap**；**默认 20**，0=关，吸附前后各跑一次，真斜墙段更长不受影响）、`--collinear_tol`（到邻点连线垂距 ≤ 此值删点，消近共线/浅回折缺口尖点，默认 2px）、`--wall_min_run`（吸附时只有 ≥ 此长度连续段的墙像素才算墙，拒绝断线/杂物列，默认 5）、`--crop_iqr_k/--pct_low/--pct_high`（须与生成 JSON 时一致）。
 - **点云→密度图的共享核心**在 `util/pointcloud.py`（`infer_pointcloud.py` 与本脚本共用，无 torch 依赖）；门/开口识别新增两个通用原语也在此：`float_pixels`（逐点浮点像素坐标，density_fixed_norm 的逐点版）、`estimate_floor_ceiling`（直方图峰定楼面/天花高度）。
 
+## 评估：预测 vs 真值户型（eval_floorplan.py）
+
+`eval_floorplan.py`（包装 `tools/eval_floorplan.sh`）把 `{name}_aligned_polys.json` 与 realsee
+真值户型（如 `data/custom/xinghewan_floorplan/`：`room_layout.json` 逐 pano 墙线 +
+`openings_gt.json` **人工标注**连通清单 + `rooms_extra.json` SVG 恢复的缺失房间）
+**自动配准**后输出指标。详见 `docs/eval_floorplan.md`。
+
+- 配准：两边都曼哈顿对齐 → 只搜 4×90°×镜像×尺度网格，栅格 mask 互相关（5cm 粗 + 1cm 精）定平移；
+  拟合 scale 即点云尺度质量（星河湾中线口径 0.990 ≈ MVS 尺度偏大 1%；inner 口径会额外压低 ~1%）。
+- **GT 口径 `--gt_geometry`（默认 centerline）**：`rooms_centerline.json`（墙中线多边形，
+  `floorplan.json.rooms_centerline.local_path` 指定）与预测的零厚共享墙**同口径**，无半墙厚
+  系统差；`inner` 切回 `room_layout.json` 内表面（仅历史对比用，IoU 有每边差半墙厚的天花板）。
+  无中线文件自动回退 inner。
+- 指标：逐房 IoU + 房间 P/R/F1（未匹配房带**合并/成分诊断**）、角点 P/R@0.1/0.2/0.3m
+  （@0.1m 天生低：256px 密度图一像素 ≈10cm 量化）、边界 Chamfer、openings 连通性
+  **strict/lenient 双层**（lenient 用 >50% 覆盖集合解析合并房间；两 GT 房并进同一预测房的
+  连通标 n/e 不可检出；无 openings_gt.json 自动跳过）。
+- **合并 GT 再评一轮**：预测房把多个 GT 房各覆盖 ≥95% 时判为合并（p15←客厅+餐厅+阳台B 等），
+  GT union 后重算全部房间/角点/Chamfer 指标（json 键 `merged_eval`，映射逐行打印）；
+  只合并 GT 侧，分割错位（卫D/过道D）不卷入。两轮差距 = 房间合并的总分代价。
+- 产出：`_eval.json`（机器可读全量）+ **`_eval.txt`（控制台摘要原文）** + `_eval_overlay.png`。
+- 陷阱：`room_layout.json` 的 `state=false` **不是**门窗（含家具遮挡实墙/外墙窗；`children`
+  是墙线按 state 变化点的共线细分、父 state=AND(children)），门窗 GT 只能人工标注；
+  预测 JSON 的 `world_mm` 字段名勿信，评估从 `pixel`+`normalization` 还原并按
+  `--pred_units` 换算。
+- **缺失房间恢复**：room_layout.json 缺的房间（星河湾：卫生间A/衣帽间A/阳台C）
+  从页面户型图 SVG 补回——页面 JS 渲染，用无头 Chrome+puppeteer-core 点"户型图"tab 后
+  dump `<svg>`（每房一个 path，毫米、y 向下）存 `floorplan.svg`；再与已知房间拟合逐轴
+  仿射 + **内缩定标**（SVG 是墙中线、比 GT 内表面大 ~18%，反解 buffer(-t) 得 t≈0.096m）
+  + 按 openings_gt 邻居命名，产出 `rooms_extra.json`。**`floorplan.json` 顶层 `rooms_extra`
+  字段记录该文件路径**（`local_path`），`load_gt_rooms` 优先按它解析、缺省回退同目录
+  `rooms_extra.json` 自动合并。
+- 星河湾基线（21 房完整 GT，回归对比用）：**中线口径** union IoU 0.963、mean IoU 0.849、
+  房间 F1 0.737（客厅+餐厅+阳台B 合并为 p15），合并轮 F1 0.882、大房 IoU 0.976；
+  inner 口径 union IoU 0.900、mean IoU 0.817；openings 此前实测 strict P 1.0/R 0.45、
+  **lenient F1 1.000**（现暂不评测）。
+
 ## ⚠️ 单位注意
 
-xinghewan 等 MVS 点云是**米**不是毫米。`polys_to_3d.py --units mm` 会差 1000×，按实际单位选 `--units`。
+xinghewan 等 MVS 点云是**米**不是毫米。`polys_to_3d.py --units mm` 会差 1000×，按实际单位选 `--units`（`eval_floorplan.py` 对应 `--pred_units`）。
