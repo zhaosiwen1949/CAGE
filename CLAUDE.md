@@ -162,6 +162,12 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
   + 按 openings_gt 邻居命名，产出 `rooms_extra.json`。**`floorplan.json` 顶层 `rooms_extra`
   字段记录该文件路径**（`local_path`），`load_gt_rooms` 优先按它解析、缺省回退同目录
   `rooms_extra.json` 自动合并。
+- **批量流程**：`tools/run_pipeline.sh <ply_folder> [output_root]` 逐场景预测（每场景产物写入
+  `<output_root>/<scene>/`，默认 `infer_out`），再 `tools/run_eval.sh [output_root] [gt_root]`
+  逐场景评估——遍历 `output_root` 下各场景子文件夹的 `*_aligned_polys.json`，按场景名匹配
+  `<gt_root>/<scene>_floorplan`（默认 `gt_root=data/floorplan`）跑 `eval_floorplan.sh`，`_eval.*`
+  写回该场景子文件夹；缺预测/缺 GT 的场景跳过不中断，末尾打印 evaluated/skipped/failed 汇总，
+  有场景失败则退出码非零。两脚本默认目录对齐（run_pipeline 输出 = run_eval 输入 = `infer_out`）。
 - 星河湾基线（21 房完整 GT，回归对比用）：**中线口径** union IoU 0.963、mean IoU 0.849、
   房间 F1 0.737（客厅+餐厅+阳台B 合并为 p15），合并轮 F1 0.882、大房 IoU 0.976；
   inner 口径 union IoU 0.900、mean IoU 0.817；openings 此前实测 strict P 1.0/R 0.45、
