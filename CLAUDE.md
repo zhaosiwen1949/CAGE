@@ -134,7 +134,7 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
 
 `eval_floorplan.py`（包装 `tools/eval_floorplan.sh`）把 `{name}_aligned_polys.json` 与 realsee
 真值户型（如 `data/custom/xinghewan_floorplan/`：`room_layout.json` 逐 pano 墙线 +
-`openings_gt.json` **人工标注**连通清单 + `rooms_extra.json` SVG 恢复的缺失房间）
+`rooms_centerline.json` 墙中线 + `doors_windows.json` 门窗位置 + `rooms_extra.json` SVG 恢复的缺失房间）
 **自动配准**后输出指标。详见 `docs/eval_floorplan.md`。
 
 - 配准：两边都曼哈顿对齐 → 只搜 4×90°×镜像×尺度网格，栅格 mask 互相关（5cm 粗 + 1cm 精）定平移；
@@ -144,9 +144,19 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
   系统差；`inner` 切回 `room_layout.json` 内表面（仅历史对比用，IoU 有每边差半墙厚的天花板）。
   无中线文件自动回退 inner。
 - 指标：逐房 IoU + 房间 P/R/F1（未匹配房带**合并/成分诊断**）、角点 P/R@0.1/0.2/0.3m
-  （@0.1m 天生低：256px 密度图一像素 ≈10cm 量化）、边界 Chamfer、openings 连通性
-  **strict/lenient 双层**（lenient 用 >50% 覆盖集合解析合并房间；两 GT 房并进同一预测房的
-  连通标 n/e 不可检出；无 openings_gt.json 自动跳过）。
+  （@0.1m 天生低：256px 密度图一像素 ≈10cm 量化）、边界 Chamfer。
+- **门窗位置评估（doors_windows，唯一开口口径）**：GT 侧存在 `doors_windows.json`（由 `floorplan.json.doors_windows.local_path`
+  记载，如 huizhongbeili-106；从户型图 base SVG 恢复、投影到墙中线，米制/room_layout 世界系）时，把预测
+  `openings` 的中心经配准 transform 映到 GT 系，与 GT 门/窗/门洞逐个**位置匹配**（同朝向 + 中心距 ≤
+  `--dw_match_tol 0.6`m，最近优先一对一），输出位置级 P/R/F1 + 匹配平均中心距 + **宽度 IoU**
+  （命中对的预测段/GT 段投影到沿墙方向的 1D 区间交并比，同时量化宽度与位置重叠；逐条打印 IoU + pred/gt 宽度）
+  + **按 GT 类型分列召回**（door/window/opening）+ 匹配对上的类型一致数。**预测不输出窗**（窗全在外墙、本版不产出），
+  故 window 召回必为 0——单列出来避免拖垮门/门洞判读；pred `passage`↔GT `opening` 同义。无该文件自动跳过
+  （`--no_doors_windows_eval` 强制关）。结果记入 `_eval.json`（键 `doors_windows`）与 `_eval.txt`，`_eval_overlay.png`
+  追加门/窗位置面板（绿=命中、黄=类型不符、红实=FP、红虚=漏门/门洞、灰虚=漏窗，细连线示中心偏差、旁标宽度 IoU；
+  面板按 GT 文件有无自适应增减）。huizhongbeili-106 实测 P 0.889 / R 0.400、mean width IoU 0.544（推拉门宽度识别不足拉低），
+  宽多房 passage 为唯一 FP。
+  **注**：旧的基于 `openings_gt.json` 的房间连通性评估（strict/lenient 双层）已删除、并入本口径，`openings_gt.json` 不再使用。
 - **合并 GT 再评一轮**：预测房把多个 GT 房各覆盖 ≥95% 时判为合并（p15←客厅+餐厅+阳台B 等），
   GT union 后重算全部房间/角点/Chamfer 指标（json 键 `merged_eval`，映射逐行打印）；
   只合并 GT 侧，分割错位（卫D/过道D）不卷入。两轮差距 = 房间合并的总分代价。
@@ -159,7 +169,7 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
   从页面户型图 SVG 补回——页面 JS 渲染，用无头 Chrome+puppeteer-core 点"户型图"tab 后
   dump `<svg>`（每房一个 path，毫米、y 向下）存 `floorplan.svg`；再与已知房间拟合逐轴
   仿射 + **内缩定标**（SVG 是墙中线、比 GT 内表面大 ~18%，反解 buffer(-t) 得 t≈0.096m）
-  + 按 openings_gt 邻居命名，产出 `rooms_extra.json`。**`floorplan.json` 顶层 `rooms_extra`
+  + 按门窗标注邻居命名，产出 `rooms_extra.json`。**`floorplan.json` 顶层 `rooms_extra`
   字段记录该文件路径**（`local_path`），`load_gt_rooms` 优先按它解析、缺省回退同目录
   `rooms_extra.json` 自动合并。
 - **批量流程**：`tools/run_pipeline.sh <ply_folder> [output_root]` 逐场景预测（每场景产物写入

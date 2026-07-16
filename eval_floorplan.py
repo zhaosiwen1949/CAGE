@@ -9,8 +9,9 @@ ground-truth layout in a folder like ``data/custom/xinghewan_floorplan/``:
                           plane (x, z).  INNER wall surfaces.
   rooms_centerline.json   wall-CENTERLINE room polygons (same convention as
                           the prediction) — the default GT (--gt_geometry).
-  openings_gt.json        hand-annotated room-connectivity list
-                          (door/passage), optional.
+  doors_windows.json      door/window/opening POSITIONS on the wall
+                          centrelines, optional -- scored by
+                          eval_doors_windows (the single opening evaluation).
 
 Pipeline
   1. GT rooms:    per pano polygonize horizontal lines -> union per room name.
@@ -24,13 +25,15 @@ Pipeline
   4. Metrics:     room-level IoU + precision/recall/F1 (greedy match at
                   --match_iou), corner precision/recall at --corner_tol
                   thresholds, boundary Chamfer distance, total-outline IoU
-                  and area, opening connectivity P/R/F1.
+                  and area, and door/window position P/R/F1 against
+                  doors_windows.json (when present).
   5. Merged-GT:   when one prediction swallowed several GT rooms (>=95%
                   coverage each), unify those GT rooms and score all room/
                   corner/chamfer metrics again ("accuracy if we accept the
                   merges"); pred-side splits are not unified.
   6. Outputs:     {name}_eval.json, {name}_eval.txt (the console summary),
-                  {name}_eval_overlay.png.
+                  {name}_eval_overlay.png (rooms panel + a doors/windows panel
+                  when doors_windows.json is present).
 
 Caveats (see docs/eval_floorplan.md):
   - With --gt_geometry inner, GT polygons are the INNER wall surfaces while
@@ -60,7 +63,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Polygon
 from shapely.ops import polygonize, unary_union
 from shapely import affinity
 
@@ -189,18 +192,56 @@ def load_gt_rooms_centerline(gt_dir):
     return {r['name']: Polygon(r['polygon']).buffer(0) for r in data['rooms']}
 
 
-def load_gt_openings(gt_dir, gt_rooms):
-    """openings_gt.json -> (evaluable pair list, skipped entries)."""
-    path = os.path.join(gt_dir, 'openings_gt.json')
-    if not os.path.exists(path):
-        return [], []
+def _seg_orient(seg):
+    """'h' if the segment runs mostly along x, else 'v' (along y/z)."""
+    seg = np.asarray(seg, dtype=np.float64)
+    d = seg[1] - seg[0]
+    return 'h' if abs(d[0]) >= abs(d[1]) else 'v'
+
+
+def _seg_width_iou(seg_a, seg_b, orient):
+    """1-D interval IoU of two opening segments along their shared wall axis.
+
+    Both segments lie on (nearly) the same wall, so project each onto the
+    along-wall coordinate (x for a horizontal wall, y/z for a vertical one)
+    and take the overlap / union of the two intervals.  Captures how well the
+    predicted opening's WIDTH and placement match the ground truth: 1.0 =
+    identical extent, 0.0 = no overlap along the wall."""
+    ax = 0 if orient == 'h' else 1
+    a0, a1 = sorted(np.asarray(seg_a)[:, ax])
+    b0, b1 = sorted(np.asarray(seg_b)[:, ax])
+    inter = max(0.0, min(a1, b1) - max(a0, b0))
+    union = (a1 - a0) + (b1 - b0) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def load_gt_doors_windows(gt_dir):
+    """doors_windows.json -> list of door/window/opening items in the GT
+    (rooms_centerline / room_layout world) frame, or None if the file is
+    absent (caller then skips the door/window evaluation).
+
+    Resolved via floorplan.json's `doors_windows.local_path`, else the
+    conventional doors_windows.json in gt_dir.  Each item keeps its type
+    (door / window / opening), subtype, nearest room, centre point, occupied
+    wall sub-segment and the segment's orientation ('h'/'v')."""
+    path = _meta_local_path(gt_dir, 'doors_windows')
+    if path is None:
+        return None
     with open(path) as f:
         data = json.load(f)
-    evaluable, skipped = [], []
-    for entry in data['openings']:
-        ok = entry.get('evaluable', True) and all(r in gt_rooms for r in entry['rooms'])
-        (evaluable if ok else skipped).append(entry)
-    return evaluable, skipped
+    items = []
+    for it in data.get('items', []):
+        seg = np.asarray(it['segment'], dtype=np.float64)
+        items.append({
+            'type': it['type'],
+            'subtype': it.get('subtype', ''),
+            'room': it.get('room'),
+            'center': np.asarray(it['center'], dtype=np.float64),
+            'seg': seg,
+            'orient': _seg_orient(seg),
+            'width_m': it.get('width_m'),
+        })
+    return items
 
 
 # --------------------------------------------------------------------------- #
@@ -561,106 +602,110 @@ def find_merge_groups(pred_t, gt_rooms, pairs, cov_thr=0.95):
     return groups
 
 
-def eval_openings(pred_openings, transform, pairs, room_sets,
-                  gt_rooms, gt_open, args):
-    """Connectivity-level opening comparison, strict + lenient.
+# Prediction opening types -> GT door/window/opening vocabulary.  The pipeline
+# emits 'door' (leaf openings) and 'passage' (wide multi-room openings, i.e.
+# 门洞/垭口); it never emits windows.
+_DW_PRED_TYPE = {'door': 'door', 'passage': 'opening'}
 
-    Strict: map each prediction's two room indices through the 1:1 room
-    matching to GT names and compare unordered pairs with the annotation.
-    Predictions touching unmatched rooms are 'unjudgeable' there.
 
-    Lenient: resolve each prediction room to the SET of GT rooms it covers
-    (>50% of the GT room area) so that openings on the boundary of a merged
-    prediction (e.g. 客厅+餐厅 as one room) still get credit; GT pairs whose
-    two rooms were merged into the same prediction are structurally
-    undetectable and reported apart instead of as plain misses.
+def eval_doors_windows(pred_openings, transform, gt_items, tol):
+    """Position-level door/window comparison against doors_windows.json.
+
+    Each predicted opening's centre is mapped into the GT frame and greedily
+    matched to the nearest GT item that shares its orientation and lies within
+    `tol` metres (nearest pair first, one-to-one).  A match is a position hit
+    regardless of type; whether the type also agrees is tracked separately.
+
+    Windows are never predicted (the pipeline emits doors and passages only),
+    so window recall is expected to be ~0 -- recall is broken out per GT type
+    so that expected gap does not masquerade as a door/opening failure.
     """
-    idx2name = {i: name for i, (name, _) in pairs.items()}
-    gt_pairs = {frozenset(e['rooms']): e for e in gt_open}
-
-    # ---- strict pass ----
-    matched, false_pos, unjudgeable = [], [], []
-    seen = set()
+    preds = []
     for op in pred_openings:
-        raw = op['raw']
-        rms = raw.get('rooms', [])
-        names = [idx2name.get(r) for r in rms]
-        center = transform(op['center'][None, :])[0]
-        rec = {'pred': raw, 'rooms_pred': rms, 'rooms_gt': names,
-               'center_m': [round(float(c), 3) for c in center]}
-        if len(names) != 2 or None in names:
-            unjudgeable.append(rec)
-            continue
-        key = frozenset(names)
-        if key in gt_pairs:
-            # center should sit near both rooms' shared wall: report the
-            # larger of its distances to the two room polygons.
-            off = max(gt_rooms[n].distance(Point(center)) for n in names)
-            rec['gt_type'] = gt_pairs[key]['type']
-            rec['center_off_m'] = round(float(off), 3)
-            matched.append(rec)
-            seen.add(key)
-        else:
-            false_pos.append(rec)
+        c = transform(op['center'][None, :])[0]
+        seg = transform(op['seg'])
+        raw_type = op['raw'].get('type')
+        preds.append({
+            'raw_type': raw_type,
+            'type': _DW_PRED_TYPE.get(raw_type, raw_type),
+            'center': c,
+            'seg': seg,                       # 2x2 endpoints in GT frame
+            'orient': _seg_orient(seg),
+            'width_m': op['raw'].get('width_m'),
+        })
 
-    missed = [e for k, e in gt_pairs.items() if k not in seen]
+    # candidate pairs (same orientation, within tol), greedy nearest-first
+    cand = []
+    for i, p in enumerate(preds):
+        for j, g in enumerate(gt_items):
+            if p['orient'] != g['orient']:
+                continue
+            d = float(np.hypot(*(p['center'] - g['center'])))
+            if d <= tol:
+                cand.append((d, i, j))
+    cand.sort()
+    p_used, g_used, matched = set(), set(), []
+    for d, i, j in cand:
+        if i in p_used or j in g_used:
+            continue
+        p_used.add(i)
+        g_used.add(j)
+        p, g = preds[i], gt_items[j]
+        matched.append({
+            'pred_type': p['raw_type'], 'gt_type': g['type'],
+            'gt_subtype': g['subtype'], 'gt_room': g['room'],
+            'type_ok': p['type'] == g['type'],
+            'dist_m': round(d, 3),
+            'width_iou': round(_seg_width_iou(p['seg'], g['seg'], g['orient']), 3),
+            'pred_width_m': (round(float(p['width_m']), 3)
+                             if p['width_m'] is not None else None),
+            'gt_width_m': (round(float(g['width_m']), 3)
+                           if g['width_m'] is not None else None),
+            'pred_center_m': [round(float(v), 3) for v in p['center']],
+            'gt_center_m': [round(float(v), 3) for v in g['center']],
+            'pred_seg_m': np.round(p['seg'], 3).tolist(),
+            'gt_seg_m': np.round(g['seg'], 3).tolist(),
+        })
+
+    false_pos = [{'pred_type': preds[i]['raw_type'],
+                  'center_m': [round(float(v), 3) for v in preds[i]['center']],
+                  'seg_m': np.round(preds[i]['seg'], 3).tolist(),
+                  'width_m': preds[i]['width_m']}
+                 for i in range(len(preds)) if i not in p_used]
+    missed = [{'gt_type': gt_items[j]['type'], 'subtype': gt_items[j]['subtype'],
+               'room': gt_items[j]['room'],
+               'center_m': [round(float(v), 3) for v in gt_items[j]['center']],
+               'seg_m': np.round(gt_items[j]['seg'], 3).tolist(),
+               'width_m': gt_items[j]['width_m']}
+              for j in range(len(gt_items)) if j not in g_used]
+
     tp, fp, fn = len(matched), len(false_pos), len(missed)
-    precision = tp / (tp + fp) if tp + fp else 0.
-    recall = tp / (tp + fn) if tp + fn else 0.
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.
+    prec = tp / (tp + fp) if tp + fp else 0.
+    rec = tp / (tp + fn) if tp + fn else 0.
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.
+    dists = [m['dist_m'] for m in matched]
+    ious = [m['width_iou'] for m in matched]
 
-    # ---- lenient pass ----
-    len_hits, len_fp, len_na = [], [], []
-    remaining = set(gt_pairs) - seen
-    for rec in list(unjudgeable) + list(false_pos):
-        s1, s2 = (room_sets.get(i, set()) for i in rec['rooms_pred'][:2]) \
-            if len(rec['rooms_pred']) == 2 else (set(), set())
-        if not s1 or not s2:
-            len_na.append(rec)
-            continue
-        compat = [k for k in remaining
-                  if len(k) == 2 and
-                  ((min(k) in s1 and max(k) in s2) or
-                   (min(k) in s2 and max(k) in s1))]
-        if compat:
-            key = compat[0]
-            remaining.discard(key)
-            # annotate the original record (it stays in its strict list too)
-            # so the overlay can recolor it as a lenient hit.
-            rec['resolved_pair'] = sorted(key)
-            rec['gt_type'] = gt_pairs[key]['type']
-            len_hits.append(rec)
-        else:
-            len_fp.append(rec)
+    by_type = {}
+    for t in ('door', 'window', 'opening'):
+        by_type[t] = {
+            'matched': sum(1 for m in matched if m['gt_type'] == t),
+            'total': sum(1 for g in gt_items if g['type'] == t),
+        }
+    type_ok = sum(1 for m in matched if m['type_ok'])
 
-    # GT pairs both of whose rooms sit inside one predicted room can never
-    # be detected as an opening -- that error already shows up as a room
-    # merge, so list them separately.
-    undetectable, len_missed = [], []
-    for k in remaining:
-        merged = any(set(k) <= s for s in room_sets.values())
-        (undetectable if merged else len_missed).append(gt_pairs[k])
-
-    ltp = tp + len(len_hits)
-    lfp = len(len_fp)
-    lfn = len(len_missed)
-    lprec = ltp / (ltp + lfp) if ltp + lfp else 0.
-    lrec = ltp / (ltp + lfn) if ltp + lfn else 0.
-    lf1 = 2 * lprec * lrec / (lprec + lrec) if lprec + lrec else 0.
-
-    return {'tp': tp, 'fp': fp, 'fn': fn,
-            'precision': round(precision, 3), 'recall': round(recall, 3),
-            'f1': round(f1, 3),
-            'matched': matched, 'false_positives': false_pos,
-            'missed': missed, 'unjudgeable': unjudgeable,
-            'lenient': {
-                'tp': ltp, 'fp': lfp, 'fn': lfn,
-                'precision': round(lprec, 3), 'recall': round(lrec, 3),
-                'f1': round(lf1, 3),
-                'extra_hits': len_hits, 'false_positives': len_fp,
-                'missed': len_missed, 'undetectable_merged': undetectable,
-                'unjudgeable': len_na,
-            }}
+    return {
+        'match_tol_m': tol,
+        'n_pred': len(preds), 'n_gt': len(gt_items),
+        'gt_counts': {t: by_type[t]['total'] for t in by_type},
+        'tp': tp, 'fp': fp, 'fn': fn,
+        'precision': round(prec, 3), 'recall': round(rec, 3), 'f1': round(f1, 3),
+        'mean_center_dist_m': round(float(np.mean(dists)), 3) if dists else None,
+        'mean_width_iou': round(float(np.mean(ious)), 3) if ious else None,
+        'by_gt_type': by_type,
+        'type_agreement': {'ok': type_ok, 'of': tp},
+        'matched': matched, 'false_positives': false_pos, 'missed': missed,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -678,23 +723,18 @@ def _setup_cjk_font():
     plt.rcParams['axes.unicode_minus'] = False
 
 
-def save_overlay(out_path, gt_rooms, pred_polys, pairs, transform,
-                 openings_result):
-    _setup_cjk_font()
-    fig, axes = plt.subplots(1, 2, figsize=(22, 11))
+def _draw_gt_rooms(ax, gt_rooms):
+    """Blue GT room outlines + names, shared background of every panel."""
+    ax.set_aspect('equal')
+    for name, gp in gt_rooms.items():
+        xs, ys = gp.exterior.xy
+        ax.plot(xs, ys, color='#1f3d7a', lw=2)
+        c = gp.representative_point()
+        ax.text(c.x, c.y, name, color='#1f3d7a', fontsize=9,
+                ha='center', va='center')
 
-    # GT z grows toward the top of the floor-plan image, which matches a
-    # normal (y-up) matplotlib axis -- no flipping needed.
-    for ax in axes:
-        ax.set_aspect('equal')
-        for name, gp in gt_rooms.items():
-            xs, ys = gp.exterior.xy
-            ax.plot(xs, ys, color='#1f3d7a', lw=2)
-            c = gp.representative_point()
-            ax.text(c.x, c.y, name, color='#1f3d7a', fontsize=9,
-                    ha='center', va='center')
 
-    ax = axes[0]
+def _draw_rooms_panel(ax, pred_polys, pairs):
     ax.set_title('rooms: GT (blue outline) vs prediction (orange fill)')
     for i, pp in enumerate(pred_polys):
         xs, ys = pp.exterior.xy
@@ -707,27 +747,56 @@ def save_overlay(out_path, gt_rooms, pred_polys, pairs, transform,
         ax.text(c.x, c.y + 0.35, label, color='#7a3a00', fontsize=8,
                 ha='center', va='center')
 
-    ax = axes[1]
-    ax.set_title('openings: green=hit  yellow-green=lenient hit (merged room)  '
-                 'red=false positive  gray=unjudgeable  purple dashed=missed')
-    def _draw(rec, color):
-        seg = transform(np.asarray([rec['pred_seg'][0], rec['pred_seg'][1]]))
-        ax.plot(seg[:, 0], seg[:, 1], color=color, lw=6, alpha=0.9,
+
+def _draw_doors_windows_panel(ax, dw_result):
+    """Door/window POSITION matching: GT segment (thick) vs predicted opening
+    segment (thin dashed) with a connector to show the centre offset."""
+    ax.set_title('doors/windows (position): green=hit  yellow=hit, type differs\n'
+                 'red=false positive  red dashed=missed door/opening  '
+                 'gray dashed=missed window (never predicted)', fontsize=10)
+    for m in dw_result['matched']:
+        col = '#2ca02c' if m['type_ok'] else '#f5b800'
+        g = np.asarray(m['gt_seg_m'])
+        p = np.asarray(m['pred_seg_m'])
+        ax.plot(g[:, 0], g[:, 1], color=col, lw=6, alpha=0.9,
                 solid_capstyle='butt')
-    for rec in openings_result['matched']:
-        _draw(rec, '#2ca02c')
-    for rec in openings_result['false_positives']:
-        _draw(rec, '#9acd32' if rec.get('resolved_pair') else '#d62728')
-    for rec in openings_result['unjudgeable']:
-        _draw(rec, '#9acd32' if rec.get('resolved_pair') else '#999999')
-    lenient = openings_result.get('lenient', {})
-    resolved = {frozenset(r['resolved_pair'])
-                for r in lenient.get('extra_hits', [])}
-    for e in openings_result['missed']:
-        if frozenset(e['rooms']) in resolved:
-            continue
-        a, b = (gt_rooms[r].representative_point() for r in e['rooms'])
-        ax.plot([a.x, b.x], [a.y, b.y], color='#9467bd', lw=2, ls='--')
+        ax.plot(p[:, 0], p[:, 1], color=col, lw=2, ls=(0, (2, 2)))
+        pc, gc = m['pred_center_m'], m['gt_center_m']
+        ax.plot([pc[0], gc[0]], [pc[1], gc[1]], color=col, lw=1)
+        ax.text(gc[0], gc[1], 'IoU %.2f' % m['width_iou'], color=col,
+                fontsize=7, ha='center', va='bottom')
+    for f in dw_result['false_positives']:
+        s = np.asarray(f['seg_m'])
+        ax.plot(s[:, 0], s[:, 1], color='#d62728', lw=6, alpha=0.9,
+                solid_capstyle='butt')
+    for e in dw_result['missed']:
+        col = '#999999' if e['gt_type'] == 'window' else '#d62728'
+        s = np.asarray(e['seg_m'])
+        ax.plot(s[:, 0], s[:, 1], color=col, lw=3, ls='--', alpha=0.9)
+
+
+def save_overlay(out_path, gt_rooms, pred_polys, pairs, dw_result=None):
+    _setup_cjk_font()
+
+    # rooms is always shown; the door/window panel only when there is
+    # something to draw (doors_windows.json present).
+    panels = ['rooms']
+    if dw_result and any(dw_result.get(k) for k in
+                         ('matched', 'false_positives', 'missed')):
+        panels.append('doors_windows')
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(11 * len(panels), 11),
+                             squeeze=False)
+    axes = axes[0]
+    # GT z grows toward the top of the floor-plan image, which matches a
+    # normal (y-up) matplotlib axis -- no flipping needed.
+    for ax in axes:
+        _draw_gt_rooms(ax, gt_rooms)
+    for ax, kind in zip(axes, panels):
+        if kind == 'rooms':
+            _draw_rooms_panel(ax, pred_polys, pairs)
+        elif kind == 'doors_windows':
+            _draw_doors_windows_panel(ax, dw_result)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=130)
@@ -791,43 +860,44 @@ def summary_text(result):
     L.append('')
     L.append('=== corners (matched rooms) ===')
     _format_corners(L, r['corners'])
-    if 'openings' in r:
-        o = r['openings']
+    if 'doors_windows' in r:
+        dw = r['doors_windows']
+        gc = dw['gt_counts']
+        bt = dw['by_gt_type']
+        ta = dw['type_agreement']
+        md = ('%.2f m' % dw['mean_center_dist_m']
+              if dw['mean_center_dist_m'] is not None else 'n/a')
+        mi = ('%.3f' % dw['mean_width_iou']
+              if dw['mean_width_iou'] is not None else 'n/a')
         L.append('')
-        L.append('=== openings (connectivity level) ===')
-        L.append('strict (1:1 matched rooms only):')
-        L.append('TP %d  FP %d  FN %d   P %.3f  R %.3f  F1 %.3f' %
-                 (o['tp'], o['fp'], o['fn'], o['precision'], o['recall'],
-                  o['f1']))
-        for rec in o['matched']:
-            L.append('  hit   %s-%s  (%s, center off %.2f m)' %
-                     (rec['rooms_gt'][0], rec['rooms_gt'][1], rec['gt_type'],
-                      rec['center_off_m']))
-        lo = o['lenient']
-        L.append('lenient (merged prediction rooms resolved by coverage):')
-        L.append('TP %d  FP %d  FN %d   P %.3f  R %.3f  F1 %.3f' %
-                 (lo['tp'], lo['fp'], lo['fn'], lo['precision'], lo['recall'],
-                  lo['f1']))
-        for rec in lo['extra_hits']:
-            L.append('  hit*  %s-%s  (%s, via merged room)' %
-                     (rec['resolved_pair'][0], rec['resolved_pair'][1],
-                      rec['gt_type']))
-        for rec in lo['false_positives']:
-            names = [gt if gt is not None else '?'
-                     for gt in rec['rooms_gt']]
-            L.append('  FP    %s-%s (pred rooms %s)' %
-                     (names[0], names[1], rec['rooms_pred']))
-        for e in lo['missed']:
-            L.append('  miss  %s-%s (%s)' %
-                     (e['rooms'][0], e['rooms'][1], e['type']))
-        for e in lo['undetectable_merged']:
-            L.append('  n/e   %s-%s (rooms merged into one prediction; '
-                     'shows up as a room-level error instead)' %
-                     (e['rooms'][0], e['rooms'][1]))
-        for rec in lo['unjudgeable']:
-            sides = ['%s' % gt if gt is not None else 'p%d?' % i
-                     for gt, i in zip(rec['rooms_gt'], rec['rooms_pred'])]
-            L.append('  n/a   %s (a side covers no GT room)' % '-'.join(sides))
+        L.append('=== doors/windows (position level) ===')
+        L.append('match tol %.2f m' % dw['match_tol_m'])
+        L.append('pred %d   gt %d (door %d, window %d, opening %d)' %
+                 (dw['n_pred'], dw['n_gt'], gc['door'], gc['window'],
+                  gc['opening']))
+        L.append('matched %d   P %.3f  R %.3f  F1 %.3f   '
+                 'mean center dist %s   mean width IoU %s' %
+                 (dw['tp'], dw['precision'], dw['recall'], dw['f1'], md, mi))
+        L.append('by GT type:  door %d/%d   window %d/%d   opening %d/%d' %
+                 (bt['door']['matched'], bt['door']['total'],
+                  bt['window']['matched'], bt['window']['total'],
+                  bt['opening']['matched'], bt['opening']['total']))
+        L.append('type agreement on matched: %d/%d' % (ta['ok'], ta['of']))
+        for m in dw['matched']:
+            L.append('  %s  pred %-7s -> GT %-7s %-6s room=%s  '
+                     'dist %.2f m  IoU %.2f  (w pred %.2f / gt %.2f m)' %
+                     ('hit ' if m['type_ok'] else 'hit~', m['pred_type'],
+                      m['gt_type'], m['gt_subtype'], m['gt_room'], m['dist_m'],
+                      m['width_iou'],
+                      m['pred_width_m'] if m['pred_width_m'] is not None else 0.0,
+                      m['gt_width_m'] if m['gt_width_m'] is not None else 0.0))
+        for f in dw['false_positives']:
+            L.append('  FP    pred %-7s center=(%.2f, %.2f)' %
+                     (f['pred_type'], f['center_m'][0], f['center_m'][1]))
+        for e in dw['missed']:
+            L.append('  miss  GT %-7s %-6s room=%s center=(%.2f, %.2f)' %
+                     (e['gt_type'], e['subtype'], e['room'],
+                      e['center_m'][0], e['center_m'][1]))
     if 'merged_eval' in r:
         m = r['merged_eval']
         L.append('')
@@ -855,7 +925,8 @@ def get_args_parser():
     p = argparse.ArgumentParser('Floor-plan evaluation against realsee GT')
     p.add_argument('--pred', required=True, help='{name}_aligned_polys.json')
     p.add_argument('--gt_dir', required=True,
-                   help='folder with room_layout.json (+ openings_gt.json)')
+                   help='folder with room_layout.json (+ optional '
+                        'rooms_centerline.json / doors_windows.json)')
     p.add_argument('--output_dir', default='infer_out')
     p.add_argument('--pred_units', choices=['m', 'mm'], default='m',
                    help='unit of the original .ply (MVS scenes are metres)')
@@ -875,7 +946,10 @@ def get_args_parser():
     p.add_argument('--raster_res_fine', type=float, default=0.01)
     p.add_argument('--match_iou', type=float, default=0.5)
     p.add_argument('--corner_tol', type=float, nargs='+', default=[0.1, 0.2, 0.3])
-    p.add_argument('--no_openings_eval', action='store_true')
+    p.add_argument('--dw_match_tol', type=float, default=0.6,
+                   help='door/window position match tolerance, metres '
+                        '(centre distance; matched pairs must share orientation)')
+    p.add_argument('--no_doors_windows_eval', action='store_true')
     return p
 
 
@@ -951,33 +1025,26 @@ def main():
         result['merged_eval'] = {'merge_groups': merge_info, 'rooms': rooms2,
                                  'corners': corners2, 'total': total2}
 
-    # ---- openings ----
-    if not args.no_openings_eval:
-        gt_open_path = os.path.join(args.gt_dir, 'openings_gt.json')
-        gt_open, gt_open_skipped = load_gt_openings(args.gt_dir, gt_rooms)
-        if gt_open:
-            # Which GT rooms does each prediction "contain" (>50% of the GT
-            # room's area)?  Drives the lenient opening matching.
-            room_sets = {
-                i: {nm for nm, gp in gt_rooms.items()
-                    if pp.intersection(gp).area / gp.area > 0.5}
-                for i, pp in enumerate(pred_t)}
-            openings_result = eval_openings(pred_openings, transform, pairs,
-                                            room_sets, gt_rooms, gt_open, args)
-            # stash segment endpoints for the overlay drawing
-            for rec in (openings_result['matched'] +
-                        openings_result['false_positives'] +
-                        openings_result['unjudgeable']):
-                idx = next(i for i, op in enumerate(pred_openings)
-                           if op['raw'] is rec['pred'])
-                rec['pred_seg'] = pred_openings[idx]['seg'].tolist()
-            result['openings'] = openings_result
-            result['openings_gt_skipped'] = gt_open_skipped
-        elif not os.path.exists(gt_open_path):
-            print('no openings_gt.json found; skipping opening eval')
+    # ---- doors / windows / openings (position level) ----
+    # doors_windows.json (if present, referenced by floorplan.json's
+    # doors_windows.local_path) gives door/window/opening positions on the
+    # wall centrelines; score the predicted openings' positions against them.
+    # This is the single opening evaluation (the old connectivity-level path
+    # over openings_gt.json has been retired).
+    if not args.no_doors_windows_eval:
+        gt_items = load_gt_doors_windows(args.gt_dir)
+        if gt_items:
+            result['doors_windows'] = eval_doors_windows(
+                pred_openings, transform, gt_items, args.dw_match_tol)
+            print('doors/windows GT: %d items -> P %.3f R %.3f F1 %.3f' %
+                  (result['doors_windows']['n_gt'],
+                   result['doors_windows']['precision'],
+                   result['doors_windows']['recall'],
+                   result['doors_windows']['f1']))
+        elif gt_items is None:
+            print('no doors_windows.json found; skipping door/window eval')
         else:
-            print('openings_gt.json has no evaluable entries (all rooms '
-                  'missing from GT?); skipping opening eval')
+            print('doors_windows.json has no items; skipping door/window eval')
 
     out_json = os.path.join(args.output_dir, '%s_eval.json' % name)
     with open(out_json, 'w') as f:
@@ -989,10 +1056,8 @@ def main():
                 % (args.pred, args.gt_dir, gt_geom))
         f.write(summary_text(result))
 
-    empty = {'matched': [], 'false_positives': [], 'unjudgeable': [], 'missed': []}
     save_overlay(os.path.join(args.output_dir, '%s_eval_overlay.png' % name),
-                 gt_rooms, pred_t, pairs, transform,
-                 result.get('openings', empty))
+                 gt_rooms, pred_t, pairs, result.get('doors_windows'))
 
     print_summary(result)
     print('\nsaved: %s, %s, %s' % (out_json, out_txt,

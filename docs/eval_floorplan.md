@@ -1,8 +1,8 @@
 # eval_floorplan.py — 用真值户型评估预测结果
 
 把 `align_floorplan.py` 输出的 `{name}_aligned_polys.json` 与 realsee 真值户型
-（如 `data/custom/xinghewan_floorplan/`）自动配准后对比，量化房间几何与门/开口
-连通性的准确性。无 torch 依赖，本机可实跑。
+（如 `data/custom/xinghewan_floorplan/`）自动配准后对比，量化房间几何、门/窗位置的
+准确性。无 torch 依赖，本机可实跑。
 
 ## 用法
 
@@ -17,9 +17,9 @@ bash tools/eval_floorplan.sh \
 产出：
 | 文件 | 内容 |
 | --- | --- |
-| `{name}_eval.json` | 配准参数 + 全部指标 + 逐房间/逐 opening 明细（机器可读全量） |
-| `{name}_eval.txt` | 控制台打印的指标摘要原文（比 json 简洁直观，含合并 GT 再评轮） |
-| `{name}_eval_overlay.png` | 左：GT（蓝描边）叠预测（橙填充，标 IoU）；右：openings 命中情况 |
+| `{name}_eval.json` | 配准参数 + 全部指标 + 逐房间/逐 opening/逐门窗明细（机器可读全量） |
+| `{name}_eval.txt` | 控制台打印的指标摘要原文（比 json 简洁直观，含门窗位置段 + 合并 GT 再评轮） |
+| `{name}_eval_overlay.png` | 房间面板（GT 蓝描边叠预测橙填充、标 IoU）+ 有 doors_windows.json 时追加门/窗位置面板 |
 
 ## 基准数据格式（gt_dir）
 
@@ -34,13 +34,18 @@ bash tools/eval_floorplan.sh \
   与预测的零厚共享墙**同口径**，消除内表面基准的半墙厚系统差（见下"天花板效应"）。
   路径由 `floorplan.json` 顶层 `rooms_centerline.local_path` 指定；文件不存在时
   自动回退内表面基准（`--gt_geometry inner` 可强制）。
-- `openings_gt.json`（可选）：**人工标注**的房间连通清单，格式：
+- `doors_windows.json`（可选）：门/窗/门洞的**位置**清单，门窗评估的唯一 GT 口径
+  （旧的 `openings_gt.json` 连通清单已弃用、不再读取）。从户型图 base SVG 恢复、投影到墙中线，
+  米制/room_layout 世界系。格式：
   ```json
-  {"openings": [{"rooms": ["卧室A", "过道A"], "type": "door", "note": "..."}]}
+  {"items": [{"type": "door", "subtype": "单开门", "room": "卧室A",
+              "center": [x, z], "segment": [[x1,z1],[x2,z2]], "width_m": 0.81}]}
   ```
-  `evaluable: false` 表示涉及 GT 缺失房间、跳过。
-  ⚠️ 不能从 `room_layout.json` 的 `state=false` 自动提取：实测该字段既含真门，
-  也含家具遮挡的实墙和外墙窗（客厅↔卧室B 之间 3.45m 实墙也标 false）。
+  `type` ∈ door/window/opening（门/窗/门洞）；`segment` 为门窗占据的墙中线子段，`center` 为其中点。
+  路径由 `floorplan.json` 顶层 `doors_windows.local_path` 指定，缺省回退同目录 `doors_windows.json`；
+  文件不存在则跳过门窗位置评估（见"指标解读 §4"）。
+  ⚠️ 不能从 `room_layout.json` 的 `state=false` 自动提取门窗：实测该字段既含真门，
+  也含家具遮挡的实墙和外墙窗（客厅↔卧室B 之间 3.45m 实墙也标 false），只能人工/SVG 标注。
 
 ## 流程
 
@@ -61,9 +66,9 @@ bash tools/eval_floorplan.sh \
 
 ## 指标解读
 
-指标分五组：**配准质量 → 房间几何 → 角点/墙线几何 → 门/开口连通 → 合并 GT 再评**。
+指标分五组：**配准质量 → 房间几何 → 角点/墙线几何 → 门/窗位置 → 合并 GT 再评**。
 下面每个术语先给一句大白话，再说这个场景里怎么读。括号内数字是星河湾当前实测值
-（21 房完整 GT，**默认中线口径**）。
+（21 房完整 GT，**默认中线口径**）；门/窗位置一组星河湾无标注、跳过，示例数字取自 huizhongbeili-106。
 
 ### 0. 先看配准（registration）
 
@@ -127,39 +132,35 @@ bash tools/eval_floorplan.sh \
   报 mean/median/P90（米）。逐房的 `chamfer mean` 列就是这个（如 `厨房 0.092m`）。它和角点距离
   互补：角点只看拐角，Chamfer 看**整条墙线**贴不贴，能抓到"角对上了但中间墙鼓出去"这类问题。
 
-### 4. 门/开口连通（openings，连通关系级）
+### 4. 门/窗位置（doors/windows，位置级）
 
-一句话：两个房间之间该不该有门/通道，预测对不对——**只看连通关系，不看门的精确位置**。
+一句话：门/窗/门洞画在了**哪里**，位置对不对。这是**唯一**的开口评估口径——早先基于
+`openings_gt.json` 的"房间连通关系"评估已并入此处、统一改用 `doors_windows.json`。
+仅当 GT 目录有 `doors_windows.json` 时评测，否则整段跳过。
 
-> 注：GT 目录当前未放 `openings_gt.json`（暂不评测开口），该段自动跳过；
-> 下面的数字是此前标注实测值，供恢复评测时参考读法。
+预测的每个 `opening` 中心经配准 transform 映到 GT 系，与 GT 门窗逐个匹配：**同朝向**（横墙/竖墙一致）
+**且中心距 ≤ `--dw_match_tol`（默认 0.6m）**，最近优先一对一。匹配上即算位置命中（TP），不管类型对不对。
 
-GT 是人工标注的房间**连通清单**（`openings_gt.json`，如 `["卧室A","过道A"] door`）。预测的每个
-opening 落在两个预测房之间，映射成房名对后与清单比。同样用 **TP/FP/FN + P/R/F1**：
+- **P / R / F1**：位置级精确率/召回/调和平均。**匹配平均中心距**是命中门窗的平均定位误差。
+- **mean width IoU（宽度 IoU）**：命中门窗的**宽度重叠程度**。门窗都落在墙上，把预测段与 GT 段
+  投影到沿墙方向（横墙取 x、竖墙取 z）成两个 1D 区间，取**交/并**：1.0=起止完全一致，0=沿墙无重叠。
+  同时反映**宽度对不对**和**位置偏不偏**。逐条明细还打印 `IoU x.xx (w pred a / gt b m)` 便于溯源。
+- **by GT type（按类型分列召回）**：`door 6/9  window 0/8  opening 2/3`。**关键**：预测管线
+  **不输出窗**（窗全在外墙、本版不产出），所以 window 恒为 0/N——单列出来，免得把它的漏检
+  算到门/门洞头上、拖低总召回的判读。真正该看的是 door 和 opening 两列。
+- **type agreement（类型一致）**：命中的门窗里，预测类型与 GT 类型也对上的数量（`6/8`）。
+  预测的 `passage` 视作门洞（`opening`），`door` 视作门；两个 GT 门洞被判成门 → 位置命中但类型不符（标 `hit~`）。
+- **明细**：`hit`/`hit~`（命中，`~`=类型不符）、`FP`（预测有、附近无 GT 门窗，如宽多房 passage）、
+  `miss`（GT 有、预测漏，含全部窗）。
 
-- **TP（true positive，真阳性）**：预测有、GT 也有的连通（命中）。
-- **FP（false positive，假阳性）**：预测有、GT 没有（虚报一扇门）。
-- **FN（false negative，假阴性 / 漏检）**：GT 有、预测没有（漏了一扇门）。
-- **P = TP/(TP+FP)**（虚报得少不）、**R = TP/(TP+FN)**（漏得少不）、**F1** 综合。
+huizhongbeili-106 实测：`pred 9 / gt 20，matched 8，P 0.889 R 0.400 F1 0.552`，平均中心距 0.25m，
+**mean width IoU 0.544**，`门 6/9、门洞 2/3、窗 0/8`，类型一致 6/8，唯一 FP 是跨 4 房的宽 passage。
+R 偏低几乎全由"窗未产出"和上游房间合并造成，**门中心定位很准**（命中门平均 0.2m 级）；宽度 IoU 偏低
+的多是**推拉门**（如客厅 pred 0.51 / gt 1.42m → IoU 0.31），说明模型对宽门洞的**宽度识别不足**。
 
-因为存在房间合并，用**双层**口径读：
-
-- **strict（严格）**：opening 两端的预测房都必须**一对一配上** GT 房才算数。
-  `TP 9 / FP 0 / FN 11 → P 1.000 / R 0.450`：**没有一扇门虚报**（P 满分），但被合并房间
-  牵连、一半门的房号配不上而算漏（R 只 0.45）。strict 反映"在配对干净的房间之间，门判得准不准"。
-- **lenient（宽松）**：把每个预测房解析成"它盖住了哪些 GT 房（面积覆盖 >50%）"的集合，
-  跨合并房间的门也能得分。例如 餐厅→厨房 的垭口落在合并大房 p15 和 p8 之间，strict 判不了，
-  lenient 通过 p15⊇{客厅,餐厅,阳台B} 认出它 → 记 `hit*`（星彗号表示"经合并房间解析命中"）。
-  `TP 16 / FP 0 / FN 0 → P/R/F1 = 1.000`：**标注的连通全部命中，零虚报零漏检**。
-- **n/e（not evaluable，不可检出）**：两个 GT 房被并进了**同一个**预测房（如 客厅-餐厅 都在 p15 里），
-  它们之间的门在预测里根本没有"房间边界"可落，结构上无法判定——单列 4 条，**不计入漏检**
-  （这个错误已经在房间级的"合并"里扣过分，不重复惩罚）。
-- **center off（中心偏差）**：命中的门，其预测中心点离两房共享墙的距离（如 `0.18m`），是位置
-  合理性的附带参考，不参与 P/R 计算。
-
-**strict vs lenient 怎么用**：strict 是保守下限、对房间合并敏感；lenient 剥离房间合并的影响、
-单看"连通关系判得全不全"。星河湾 lenient 满分 + strict 零虚报，说明**门/开口识别本身几乎无误，
-所有连通类误差都源于上游的房间合并**，与房间级 recall 偏低同因同源。
+`_eval_overlay.png` 会追加一个门/窗位置面板：**绿**=命中、**黄**=命中但类型不符（门洞判成门）、
+**红实线**=虚报（FP）、**红虚线**=漏检门/门洞、**灰虚线**=漏检窗（预测本就不出窗）；命中的门窗还画
+一条细连线连预测中心与 GT 中心、并在旁标注该处宽度 IoU，直观显示定位与宽度偏差。
 
 ### 5. 合并 GT 再评一轮（merged-GT re-evaluation）
 
@@ -202,7 +203,7 @@ opening 落在两个预测房之间，映射成房名对后与清单比。同样
    - **内缩定标**：SVG 画的是**墙中线**、GT 是内表面，面积系统性偏大（中位数 +18%）。
      用已知房间反解 `buffer(-t)` 面积吻合的 t 取中位数（星河湾 0.096m ≈ 半墙厚），
      应用到恢复房间（卫生间A/衣帽间A 面积偏差降到 1–3%；阳台C 弧形窄条 -22% 可接受）；
-   - 剩余 path 的**命名**来自 `openings_gt.json`：缺失房间在标注里各有一个已知邻居
+   - 剩余 path 的**命名**来自门窗标注里的邻接关系：缺失房间各有一个已知邻居
      （卧室A↔卫生间A 等），距该邻居最近的剩余多边形取其名；
    - 产出 `rooms_extra.json`，并在 `floorplan.json` 顶层加 `rooms_extra` 字段
      （`local_path` 指向该文件）；`load_gt_rooms` 按此字段解析并自动合并。
@@ -229,7 +230,8 @@ opening 落在两个预测房之间，映射成房名对后与清单比。同样
 | `--raster_res/--raster_res_fine` | 0.05 / 0.01 | 配准栅格分辨率（米/像素） |
 | `--match_iou` | 0.5 | 房间匹配 IoU 门槛 |
 | `--corner_tol` | 0.1 0.2 0.3 | 角点命中阈值（米，可多个） |
-| `--no_openings_eval` | 关 | 跳过门/开口对比 |
+| `--dw_match_tol` | 0.6 | 门/窗位置匹配容差（米，中心距；配对还需同朝向） |
+| `--no_doors_windows_eval` | 关 | 跳过门/窗位置对比（无 doors_windows.json 时本就自动跳过） |
 
 ## 星河湾基线（2026-07，21 房完整 GT，供回归对比）
 
@@ -245,5 +247,7 @@ opening 落在两个预测房之间，映射成房名对后与清单比。同样
 **inner 口径（`--gt_geometry inner`，历史对比用）**：scale 0.980、union IoU 0.900、
 房间 F1 0.737、mean IoU 0.817、总轮廓 IoU 0.881、角点 P/R@0.3m ≈0.75/0.73、
 匹配角点平均偏差 0.167m；合并轮 F1 0.882、mean IoU 0.833。
-（openings 此前实测：strict P 1.000 / R 0.450、**lenient P/R/F1 = 1.000**——16 命中
-0 误检 0 漏检、4 条 n/e；当前 GT 目录暂未放 openings_gt.json，自动跳过。）
+
+**门/窗位置**：星河湾无 `doors_windows.json`、跳过；huizhongbeili-106 实测
+`P 0.889 / R 0.400 / F1 0.552`（门 6/9、门洞 2/3、窗 0/8，窗恒不产出），平均中心距 0.25m、
+**mean width IoU 0.544**（推拉门宽度识别不足拉低）。
