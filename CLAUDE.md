@@ -157,9 +157,6 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
   面板按 GT 文件有无自适应增减）。huizhongbeili-106 实测 P 0.889 / R 0.400、mean width IoU 0.544（推拉门宽度识别不足拉低），
   宽多房 passage 为唯一 FP。
   **注**：旧的基于 `openings_gt.json` 的房间连通性评估（strict/lenient 双层）已删除、并入本口径，`openings_gt.json` 不再使用。
-- **合并 GT 再评一轮**：预测房把多个 GT 房各覆盖 ≥95% 时判为合并（p15←客厅+餐厅+阳台B 等），
-  GT union 后重算全部房间/角点/Chamfer 指标（json 键 `merged_eval`，映射逐行打印）；
-  只合并 GT 侧，分割错位（卫D/过道D）不卷入。两轮差距 = 房间合并的总分代价。
 - 产出：`_eval.json`（机器可读全量）+ **`_eval.txt`（控制台摘要原文）** + `_eval_overlay.png`。
 - 陷阱：`room_layout.json` 的 `state=false` **不是**门窗（含家具遮挡实墙/外墙窗；`children`
   是墙线按 state 变化点的共线细分、父 state=AND(children)），门窗 GT 只能人工标注；
@@ -179,9 +176,8 @@ CAGE / RoomFormer 点云 → 2D 户型图重建。本文件记录本仓库自定
   写回该场景子文件夹；缺预测/缺 GT 的场景跳过不中断，末尾打印 evaluated/skipped/failed 汇总，
   有场景失败则退出码非零。两脚本默认目录对齐（run_pipeline 输出 = run_eval 输入 = `infer_out`）。
 - 星河湾基线（21 房完整 GT，回归对比用）：**中线口径** union IoU 0.963、mean IoU 0.849、
-  房间 F1 0.737（客厅+餐厅+阳台B 合并为 p15），合并轮 F1 0.882、大房 IoU 0.976；
-  inner 口径 union IoU 0.900、mean IoU 0.817；openings 此前实测 strict P 1.0/R 0.45、
-  **lenient F1 1.000**（现暂不评测）。
+  房间 F1 0.737（客厅+餐厅+阳台B 合并为 p15）；inner 口径 union IoU 0.900、mean IoU 0.817；
+  openings 此前实测 strict P 1.0/R 0.45、**lenient F1 1.000**（现暂不评测）。
 
 ## ⚠️ 单位注意
 

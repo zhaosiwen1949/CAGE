@@ -502,8 +502,7 @@ def evaluate_rooms(pred_t, gt_rooms, args):
     """One full room-geometry round against a GT room set.
 
     Greedy match, per-room IoU/corners/chamfer, unmatched diagnoses,
-    aggregated corner stats and total-outline figures.  Used twice: for the
-    original GT and for the merged-GT re-evaluation.
+    aggregated corner stats and total-outline figures.
     Returns (pairs, rooms_block, corners_block, total_block)."""
     pairs = match_rooms(pred_t, gt_rooms, args.match_iou)
     per_room, corner_rows = [], []
@@ -581,25 +580,6 @@ def evaluate_rooms(pred_t, gt_rooms, args):
         'gt_area_m2': round(gt_union.area, 1),
     }
     return pairs, rooms_block, corners_agg, total_block
-
-
-def find_merge_groups(pred_t, gt_rooms, pairs, cov_thr=0.95):
-    """Prediction rooms that swallowed several GT rooms -> {pred_i: [names]}.
-
-    A GT room belongs to prediction j's group when j covers >= cov_thr of
-    its area; the GT room 1:1-matched to j (if any) joins the group too.
-    Only groups with two or more GT rooms count as a merge (a single fully
-    covered room is just a normal match)."""
-    groups = {}
-    for j, pp in enumerate(pred_t):
-        members = [nm for nm, gp in gt_rooms.items()
-                   if pp.intersection(gp).area / gp.area >= cov_thr]
-        if j in pairs and pairs[j][0] not in members:
-            members.append(pairs[j][0])
-        if len(members) >= 2:
-            members.sort(key=lambda nm: -gt_rooms[nm].area)  # biggest first
-            groups[j] = members
-    return groups
 
 
 # Prediction opening types -> GT door/window/opening vocabulary.  The pipeline
@@ -898,20 +878,6 @@ def summary_text(result):
             L.append('  miss  GT %-7s %-6s room=%s center=(%.2f, %.2f)' %
                      (e['gt_type'], e['subtype'], e['room'],
                       e['center_m'][0], e['center_m'][1]))
-    if 'merged_eval' in r:
-        m = r['merged_eval']
-        L.append('')
-        L.append('=== merged-GT re-evaluation '
-                 '(GT rooms unified per swallowing prediction) ===')
-        for g in m['merge_groups']:
-            L.append('merge: p%-3d <- %s' % (g['pred'], ' + '.join(g['gt'])))
-        L.append('')
-        w = max([10] + [len(row['gt']) for row in m['rooms']['per_room']])
-        _format_rooms(L, m['rooms'], gt_col_w=w)
-        L.append('')
-        L.append(_total_line(m['total']))
-        L.append('corners (matched rooms, merged GT):')
-        _format_corners(L, m['corners'])
     return '\n'.join(L) + '\n'
 
 
@@ -1000,30 +966,6 @@ def main():
         'corners': corners_agg,
         'total': total,
     }
-
-    # ---- merged-GT re-evaluation ----
-    # When one prediction swallowed several GT rooms (p15 = 客厅+餐厅+阳台B),
-    # unify those GT rooms and score everything again: "how accurate is the
-    # plan if we accept the merges?"  Registration is reused (merging does
-    # not move any geometry).  Pred splits are NOT unified (kept as round-1
-    # diagnoses).
-    groups = find_merge_groups(pred_t, gt_rooms, pairs)
-    if groups:
-        merged_gt, consumed, merge_info = dict(gt_rooms), set(), []
-        for j, members in sorted(groups.items()):
-            members = [nm for nm in members if nm not in consumed]
-            if len(members) < 2:
-                continue
-            consumed.update(members)
-            mname = '+'.join(members)
-            for nm in members:
-                merged_gt.pop(nm)
-            merged_gt[mname] = unary_union(
-                [gt_rooms[nm] for nm in members]).buffer(0)
-            merge_info.append({'pred': j, 'gt': members, 'merged_name': mname})
-        _, rooms2, corners2, total2 = evaluate_rooms(pred_t, merged_gt, args)
-        result['merged_eval'] = {'merge_groups': merge_info, 'rooms': rooms2,
-                                 'corners': corners2, 'total': total2}
 
     # ---- doors / windows / openings (position level) ----
     # doors_windows.json (if present, referenced by floorplan.json's
