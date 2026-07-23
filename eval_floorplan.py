@@ -55,6 +55,7 @@ Caveats (see docs/eval_floorplan.md):
 import argparse
 import json
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -693,14 +694,30 @@ def eval_doors_windows(pred_openings, transform, gt_items, tol):
 # --------------------------------------------------------------------------- #
 
 def _setup_cjk_font():
-    """Pick an installed CJK-capable font so room names render."""
+    """Pick an installed CJK-capable font so room names render.
+
+    On a headless Linux server none of the macOS fonts below exist; without a
+    CJK font matplotlib silently falls back to DejaVu Sans (no Chinese glyphs)
+    and every 汉字 renders as a tofu box.  Try a broad list covering macOS,
+    common Linux packages (fonts-noto-cjk, wqy-zenhei, source-han-sans) and
+    Windows, then warn loudly if none matched so the cause is obvious."""
+    plt.rcParams['axes.unicode_minus'] = False
     have = {f.name for f in font_manager.fontManager.ttflist}
-    for name in ('Hiragino Sans GB', 'PingFang SC', 'Arial Unicode MS',
-                 'Noto Sans CJK SC', 'Songti SC'):
+    candidates = (
+        'Hiragino Sans GB', 'PingFang SC', 'Arial Unicode MS', 'Songti SC',
+        'Noto Sans CJK SC', 'Noto Sans CJK JP', 'Noto Serif CJK SC',
+        'Source Han Sans SC', 'Source Han Sans CN', 'WenQuanYi Zen Hei',
+        'WenQuanYi Micro Hei', 'Droid Sans Fallback', 'AR PL UMing CN',
+        'Microsoft YaHei', 'SimHei', 'SimSun',
+    )
+    for name in candidates:
         if name in have:
             plt.rcParams['font.family'] = name
-            break
-    plt.rcParams['axes.unicode_minus'] = False
+            return
+    print('WARNING: no CJK font found; Chinese labels will render as tofu '
+          'boxes. Install one (e.g. `apt-get install fonts-noto-cjk` or '
+          '`fonts-wqy-zenhei`) then clear the cache (`rm -rf '
+          '~/.cache/matplotlib`).', file=sys.stderr)
 
 
 def _draw_gt_rooms(ax, gt_rooms):
